@@ -11,7 +11,9 @@ import pytest
 import torch
 
 from rl2.envs.gym_style_env import StopReason
+from rl2.envs.visfly.power import PowerConfig, PowerUsage
 from rl2.envs.visfly.render import depth_panel, fit_panel
+from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv, convert_observation
 
 
@@ -88,6 +90,99 @@ def test_rng_streams_are_independent_of_evaluation_and_global_draws() -> None:
                 np.testing.assert_array_equal(actual.rewards, expected.rewards)
                 torch.testing.assert_close(torch.get_rng_state(), global_rng)
                 assert random.getstate() == global_python_rng
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"energy_weight": -1},
+        {"excess_power_weight": -1},
+        {"power_threshold": 0},
+        {"energy_weight": float("nan")},
+        {"power_threshold": float("inf")},
+    ],
+)
+def test_power_configuration_rejects_invalid_values(values: dict[str, float]) -> None:
+    with pytest.raises(ValueError):
+        PowerConfig(**values)
+
+
+def test_power_configuration_rejects_nested_kwargs_before_backend_loading() -> None:
+    with (
+        patch("rl2.envs.visfly_env.load_env_creator") as loader,
+        pytest.raises(ValueError, match="env.power"),
+    ):
+        VisFlyEnv(config=VisFlyConfig(kwargs={"power": {}}), num_envs=1, seed=7)
+    loader.assert_not_called()
+
+
+def test_sampled_starts_in_step_info_include_resets_and_are_consumed_once() -> None:
+    route = Route(
+        points=((0.0, 0.0, 0.0), (3.0, 4.0, 0.0)),
+        direct_blocked=False,
+        constrained=False,
+        long=False,
+        detour_threshold=1.25,
+    )
+    config = VisFlyConfig(scene_rotation_env_steps=2, route_sampling=RouteConfig())
+    with (
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=random_backend),
+        closing(VisFlyEnv(config=config, num_envs=1, seed=7)) as env,
+    ):
+        env.backend.sampled_routes = []
+        reset = env.backend.reset.side_effect
+
+        def reset_with_route() -> RawVisFlyObservation[torch.Tensor]:  # leaves: (B, *O)
+            env.backend.sampled_routes.append(route)
+            return reset()
+
+        env.backend.reset.side_effect = reset_with_route
+        env.reset()
+        # A newly sampled autoreset start arrives alongside the initial start.
+        env.backend.sampled_routes.append(route)
+        actions = np.zeros((1, 4), dtype=np.float32)  # (B, A)
+        initial = env.step(actions).info["route_sampling"]
+        assert all(value.shape == (2,) for value in initial.values())
+        np.testing.assert_array_equal(initial["initial_goal_distance_meters"], [5, 5])
+        np.testing.assert_array_equal(initial["reference_route_length_meters"], [5, 5])
+        np.testing.assert_array_equal(initial["direct_path_blocked"], [False, False])
+        np.testing.assert_array_equal(initial["difficulty"], ["easy", "easy"])
+        assert env.backend.sampled_routes == []
+        rotated = env.step(actions).info["route_sampling"]
+        assert all(value.shape == (1,) for value in rotated.values())
+        assert "route_sampling" not in env.step(actions).info
+        np.testing.assert_array_equal(initial["initial_goal_distance_meters"], [5, 5])
+
+
+def test_power_snapshots_survive_scene_reset_and_preserve_measured_zeros() -> None:
+    config = VisFlyConfig(scene_rotation_env_steps=1, power=PowerConfig(energy_weight=2.0, excess_power_weight=3.0))
+    with (
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=random_backend),
+        closing(VisFlyEnv(config=config, num_envs=1, seed=7)) as env,
+    ):
+        env.backend.envs.dynamics.dt = 0.01
+        env.backend.envs.dynamics._interval_steps = 2
+        env.reset()
+        env.backend.power_usage = PowerUsage(
+            energy=torch.tensor([0.04]),  # (B,)
+            excess=torch.tensor([0.01]),  # (B,)
+        )
+        transition = env.step(np.zeros((1, 4), dtype=np.float32))
+        env.backend.power_usage.energy.zero_()
+        assert transition.info["energy_hover_seconds"].shape == (1,)
+        assert "power_ratio_max" not in transition.info
+        np.testing.assert_allclose(transition.info["energy_hover_seconds"], 0.04)
+        np.testing.assert_allclose(transition.info["power_ratio"], 2.0)
+        np.testing.assert_allclose(transition.info["power_penalty"], 0.11)
+        env.reset()
+        env.backend.power_usage = PowerUsage(
+            energy=torch.zeros(1),  # (B,)
+            excess=torch.zeros(1),  # (B,)
+        )
+        transition = env.step(np.zeros((1, 4), dtype=np.float32))
+        for name in ("energy_hover_seconds", "power_ratio", "power_penalty"):
+            assert transition.info[name].shape == (1,)
+            np.testing.assert_array_equal(transition.info[name], [0.0])
 
 
 @pytest.mark.parametrize("operation", ["load", "construct", "reset", "step"])

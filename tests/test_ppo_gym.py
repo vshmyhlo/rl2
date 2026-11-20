@@ -5,6 +5,7 @@ from contextlib import closing
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal
 from unittest.mock import MagicMock, Mock, patch
 
@@ -23,8 +24,9 @@ from rl2 import train_ppo_gym as ppo
 from rl2.actions import BetaPolicy, CategoricalPolicy, ContinuousSpace, Policy, TruncatedGaussianPolicy
 from rl2.envs import GymStyleEnv, GymStyleStep
 from rl2.envs.gym_env import GymConfig, GymEnv
-from rl2.envs.gym_style_env import StopReason
+from rl2.envs.gym_style_env import GymStyleInfo, RouteSamplingInfo, StopReason
 from rl2.envs.visfly import generate_manifest as manifest_generation
+from rl2.envs.visfly.power import PowerConfig, PowerUsage
 from rl2.envs.visfly.render import RenderContext, diagnostics_panel, top_down_panel
 from rl2.envs.visfly.routes import CATEGORIES, Route, RouteConfig
 from rl2.envs.visfly.scenarios import EvaluationConfig, Manifest, Scenario, SceneCoverage
@@ -152,6 +154,7 @@ def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
         assert result.final_observations["state"].shape == (4, 13)
         assert result.info["goal_distance"].shape == (4,)
         assert result.info["goal_distance"].dtype == np.float32
+        assert "energy_hover_seconds" not in result.info
         np.testing.assert_allclose(result.info["goal_distance"], np.sqrt(3) * np.array([10, 20, 30, 1]))
         np.testing.assert_array_equal(result.terminated, [True, False, True, False])
         np.testing.assert_array_equal(result.truncated, [False, True, True, False])
@@ -170,7 +173,7 @@ def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
             device="cpu",
             visual=True,
         )
-        assert env.render().shape == (4, 4, 14, 3)
+        assert env.render().shape == (4, 8, 10, 3)
     assert backend.closed
 
 
@@ -354,9 +357,60 @@ def test_deterministic_policy_step(kind: str, action_shape: tuple[int, ...]) -> 
         np.testing.assert_array_equal(jax.device_get(leaf), [[1], [2]])
 
 
+def test_step_info_metrics_weight_samples_preserve_zeros_and_omit_missing_values() -> None:
+    metrics = ppo.RolloutInfoMetrics()
+    metrics.add(GymStyleInfo(stop_reason=np.zeros(2, dtype=np.int32)))  # (B,)
+    assert metrics.metrics() == {}
+    metrics.add(
+        GymStyleInfo(
+            energy_hover_seconds=np.array([0.04, 0.0], dtype=np.float32),  # (B,)
+            power_ratio=np.array([2.0, 0.0], dtype=np.float32),  # (B,)
+            power_penalty=np.zeros(2, dtype=np.float32),  # (B,)
+            route_sampling=RouteSamplingInfo(
+                initial_goal_distance_meters=np.array([3.0, 6.0, 9.0]),  # (N,)
+                reference_route_length_meters=np.array([3.0, 6.0, 15.0]),  # (N,)
+                direct_path_blocked=np.array([False, False, True]),  # (N,)
+                difficulty=np.array(["easy", "easy", "hard"]),  # (N,)
+            ),
+        )
+    )
+    # A later step has fewer sampled starts; averages must weight starts, not steps.
+    metrics.add(
+        GymStyleInfo(
+            energy_hover_seconds=np.array([0.02, 0.06], dtype=np.float32),  # (B,)
+            power_ratio=np.array([1.0, 3.0], dtype=np.float32),  # (B,)
+            power_penalty=np.zeros(2, dtype=np.float32),  # (B,)
+            route_sampling=RouteSamplingInfo(
+                initial_goal_distance_meters=np.array([2.0]),  # (N,)
+                reference_route_length_meters=np.array([2.0]),  # (N,)
+                direct_path_blocked=np.array([False]),  # (N,)
+                difficulty=np.array(["easy"]),  # (N,)
+            ),
+        )
+    )
+    assert metrics.metrics() == pytest.approx(
+        {
+            "rollout/power_ratio": 1.5,
+            "rollout/power_penalty": 0.0,
+            "rollout/sampled_episode_count": 4,
+            "rollout/initial_goal_distance_meters": 5.0,
+            "rollout/reference_route_length_meters": 6.5,
+            "rollout/direct_path_blocked_fraction": 0.25,
+            "rollout/difficulty_fraction/easy": 0.75,
+            "rollout/difficulty_fraction/medium": 0.0,
+            "rollout/difficulty_fraction/hard": 0.25,
+        }
+    )
+
+
 def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: ppo.Config) -> None:
-    config = replace(config, env=VisFlyConfig(), num_envs=4)
+    config = replace(config, env=VisFlyConfig(power=PowerConfig()), num_envs=4)
     backend = VisFlyBatch()
+    backend.envs = SimpleNamespace(dynamics=SimpleNamespace(dt=0.01, _interval_steps=2))
+    backend.power_usage = PowerUsage(
+        energy=torch.full((4,), 0.04),  # (B,)
+        excess=torch.zeros(4),  # (B,)
+    )
     with (
         patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
         closing(ppo.make_env(config)) as env,
@@ -375,7 +429,14 @@ def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: pp
             jax.transfer_guard_device_to_host("disallow"),
             patch.object(type(runner.episode_starts), "__bool__", side_effect=AssertionError("Device scalar readback")),
         ):
-            advanced, rollout = ppo.collect_rollout(runner, state, env, config, key)
+            info_metrics = ppo.RolloutInfoMetrics()
+            advanced, rollout = ppo.collect_rollout(runner, state, env, config, key, info_metrics)
+        assert info_metrics.metrics() == pytest.approx(
+            {
+                "rollout/power_ratio": 2.0,
+                "rollout/power_penalty": 0.0,
+            }
+        )
         batch = rollout.batch
         assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves((advanced, batch)))
         assert batch.actions.shape == (4, 2, 4)
@@ -702,7 +763,7 @@ def test_visfly_render_channels_last_rectangular_camera_and_final_views() -> Non
 
 def test_configuration_round_trip(config: ppo.Config) -> None:
     values = asdict(config)
-    values["env"] = {"id": "VisFly", "num_scenes": 2, "kwargs": {"visual": True}}
+    values["env"] = {"id": "VisFly", "num_scenes": 2, "kwargs": {"visual": True}, "power": {"energy_weight": 0.1}}
     values["model"]["encoder"] = asdict(
         ppo.VisFlyEncoderConfig(
             stages=(ConvStage(channels=2, blocks=0),), embedding_size=4, goal_scale=2.0, depth_scale=4.0
@@ -711,6 +772,7 @@ def test_configuration_round_trip(config: ppo.Config) -> None:
     parsed = TypeAdapter(ppo.Config).validate_json(json.dumps(values))
     assert isinstance(parsed.env, VisFlyConfig)
     assert parsed.env.kwargs == {"visual": True}
+    assert parsed.env.power == PowerConfig(energy_weight=0.1)
     assert isinstance(parsed.model.encoder, ppo.VisFlyEncoderConfig)
     assert parsed.model.encoder.goal_scale == 2.0
     assert parsed.model.encoder.depth_scale == 4.0
@@ -766,17 +828,22 @@ def test_evaluation_configuration_modes(
 
 
 def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
-    config = replace(config, env=VisFlyConfig(), eval_episodes=2, video_max_frames=1)
+    config = replace(config, env=VisFlyConfig(power=PowerConfig()), eval_episodes=2, video_max_frames=1)
     backends = []
 
     def create(**kwargs: Any) -> VisFlyBatch:
         assert kwargs["num_scene"] == kwargs["num_agent_per_scene"] == 1
         assert kwargs["scene_split"] == "test"
         backend = VisFlyBatch(num_envs=1)
+        backend.envs = SimpleNamespace(dynamics=SimpleNamespace(dt=0.01, _interval_steps=2))
         step = backend.step
 
         def delayed_done(actions: NDArray[np.float32]) -> tuple[Any, ...]:  # (1, 4)
             observations, rewards, done, infos = step(actions)
+            backend.power_usage = PowerUsage(
+                energy=torch.tensor([0.02 * backend.steps]),  # (B,)
+                excess=torch.zeros(1),  # (B,)
+            )
             if backend.steps == 1:
                 done[:] = False
             return observations, rewards, done, infos
@@ -805,7 +872,33 @@ def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
     assert scalars["eval/final_goal_distance_meters"] == pytest.approx(np.sqrt(300))
     assert scalars["eval/termination_fraction"] == 1
     assert scalars["eval/truncation_fraction"] == 0
+    assert "eval/energy_hover_seconds" not in scalars
+    assert "eval/energy_hover_seconds/success" not in scalars
+    assert scalars["eval/power_ratio"] == pytest.approx(1.5)
+    assert "eval/power_ratio_max" not in scalars
+    report = json.loads(writer.log_text.call_args.args[0])
+    assert report["episodes"][0]["power_ratio"] == pytest.approx(1.5)
+    assert all("energy_hover_seconds" not in episode for episode in report["episodes"])
+    assert all("power_ratio_max" not in episode for episode in report["episodes"])
     writer.log_video.assert_not_called()
+
+
+def test_evaluation_preserves_zero_power_for_failed_episode(config: ppo.Config) -> None:
+    config = replace(config, eval_episodes=1, eval_video=False)
+    episode = ppo.EpisodeResult(
+        episode_return=0.0,
+        length=1,
+        frames=[],
+        stop_reason=StopReason.COLLISION,
+        terminated=True,
+        power_ratio=0.0,
+    )
+    writer = Mock()
+    with patch.object(ppo, "play_episode", return_value=episode):
+        ppo.log_evaluation(Mock(), config, writer, 0, 4, initial_carry=())
+    metrics = writer.log_metrics.call_args.args[0]
+    assert metrics["eval/power_ratio"] == 0.0
+    assert "eval/energy_hover_seconds/success" not in metrics
 
 
 @pytest.mark.parametrize("availability", ["complete", "missing", "partial", "zero_distance"])
@@ -827,6 +920,7 @@ def test_evaluation_stop_fractions_exclude_video_replay(
             final_goal_distance=(0.0 if success or availability == "zero_distance" else 2.0)
             if complete or (availability == "partial" and success)
             else None,
+            power_ratio=0.0 if complete or (availability == "partial" and success) else None,
         )
         for reward, success in [(1.0, True), (0.0, False)]
     ]
@@ -837,6 +931,7 @@ def test_evaluation_stop_fractions_exclude_video_replay(
         stop_reason=StopReason.SUCCESS,
         terminated=True,
         final_goal_distance=100.0,  # Replay must not affect scored distances.
+        power_ratio=100.0,
     )
     writer = Mock()
     with patch.object(ppo, "play_episode", side_effect=[*episodes, replay]) as play:
@@ -858,9 +953,13 @@ def test_evaluation_stop_fractions_exclude_video_replay(
         }
         assert sum(fractions.values()) == 1
         assert scalars["eval/final_goal_distance_meters"] == (0 if availability == "zero_distance" else 1)
+        assert scalars["eval/power_ratio"] == 0
     else:
         assert fractions == {}
         assert "eval/final_goal_distance_meters" not in scalars
+        assert "eval/energy_hover_seconds" not in scalars
+        assert "eval/energy_hover_seconds/success" not in scalars
+        assert "eval/power_ratio" not in scalars
     report = json.loads(writer.log_text.call_args.args[0])
     assert len(report["episodes"]) == 2
     assert ("stop_reason" in report["episodes"][0]) == (availability != "missing")
@@ -881,11 +980,6 @@ def test_train_orchestration_uses_host_env_and_closes_resources(
 ) -> None:
     config = replace(config, total_steps=11 if resume else 4, anneal_lr=True, run_id="host-test")
     env = Mock(action_space=gym.spaces.Discrete(2))
-    if accepted and not resume:
-        config = replace(config, env=VisFlyConfig(route_sampling=RouteConfig()))
-        env = Mock(spec=VisFlyEnv, action_space=gym.spaces.Discrete(2))
-        env.backend = Mock()
-        env.backend.sampling_metrics.return_value = {"rollout/direct_path_blocked_fraction": 0.75}
     env.reset.return_value = np.zeros((2, 3), dtype=np.float32)  # (B, O)
     model = Mock()
     model.initial_carry.side_effect = lambda batch: ((jnp.zeros((batch, 1)), jnp.zeros((batch, 1))),)
@@ -915,8 +1009,10 @@ def test_train_orchestration_uses_host_env_and_closes_resources(
         key: jax.Array,  # ()
         metrics: ppo.TrainingMetrics,
         schedule_index: int,
+        info_metrics: ppo.RolloutInfoMetrics,
     ) -> ppo.TrainStepResult:
         assert envs is env
+        info_metrics.add(GymStyleInfo(power_ratio=np.array([1.25, 0.0], dtype=np.float32)))  # (B,)
         assert schedule_index == (1 if resume else 0)
         window = metrics.window._replace(
             minibatch_count=jnp.asarray(3),
@@ -967,9 +1063,7 @@ def test_train_orchestration_uses_host_env_and_closes_resources(
         scalars["train/policy_loss"] + config.value_coef * scalars["train/value_loss"] + scalars["train/entropy_loss"]
     )
     assert scalars["rollout/episode_count"] == 0
-    if accepted and not resume:
-        assert scalars["rollout/direct_path_blocked_fraction"] == 0.75
-        env.backend.sampling_metrics.assert_called_once_with()
+    assert scalars["rollout/power_ratio"] == 0.625
     assert scalars["train/episodes_total"] == (5 if resume else 0)
     assert "rollout/episode_length_steps" not in scalars
     if resume:

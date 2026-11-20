@@ -75,6 +75,19 @@ Window metrics:
         Windows end after the required metric device-to-host transfer; the first
         starts before collection. Startup and final logging/checkpoint drain are excluded.
 
+VisFly consumption window metrics (only with env.power):
+    rollout/power_ratio: Mean action power relative to hover over all transitions;
+        each action averages its physics substeps. Dimensionless.
+    rollout/power_penalty: Mean nonnegative consumption reward cost per transition.
+        Both means include terminal transitions and scene rotations.
+        Power is mean((max(rotor_thrust, 0) / (mass * 9.81 / 4)) ** 1.5) over rotors.
+        Costs integrate power and squared above-threshold power over physics substeps.
+        These are uncalibrated effort estimates, not watts or joules. Zero weights
+        retain measurements. Log at log_interval and final windows at completed
+        environment steps; omit empty windows or disabled models. Sums reset after
+        logging, survive episode/scene resets, and are not restored from checkpoints.
+        Measurements arrive through step info and are accumulated on the host.
+
 VisFly route-sampling window metrics (only with env.route_sampling):
     rollout/sampled_episode_count: Number of starts sampled since the preceding
         log window, including initial starts in the first window; not cumulative.
@@ -91,7 +104,8 @@ VisFly route-sampling window metrics (only with env.route_sampling):
         available in each loaded scene. These summaries describe sampled episodes,
         not completed episodes or transitions. Omit all when no starts were sampled.
         Log at log_interval and final windows using completed environment steps;
-        sums reset after logging and are not restored from checkpoints.
+        Step info includes starts from initial resets, autoresets, and scene rotations.
+        Host sums reset after logging and are not restored from checkpoints.
 
 Lifetime metrics:
     train/iterations_total, train/updates_total, train/episodes_total, train/env_steps_total:
@@ -121,6 +135,12 @@ Latest settings and session timings:
         environment step; excludes logging this timing itself. No window means omitted.
     model/params_millions: Parameter count divided by one million, logged once at
         startup, including resume; not cumulative.
+
+VisFly evaluation consumption metric (only with complete env.power measurements):
+    eval/power_ratio: Mean of episode mean power ratios (equal episode weighting).
+        Includes terminal actions and all scored episode outcomes.
+        Logged per evaluation at completed training environment steps, excluding
+        video replays; not cumulative. Individual values are saved in the report.
 
 Evaluation and its video replays use deterministic actions: categorical argmax,
 clipped Gaussian means, or Beta means scaled to the action bounds. Training and
@@ -273,7 +293,7 @@ from rl2.actions import (
 )
 from rl2.configuration import BaseConfig, load_config
 from rl2.envs.gym_env import GymConfig, GymEnv, GymObservation
-from rl2.envs.gym_style_env import STOP_REASON_NAMES, GymStyleEnv, StopReason
+from rl2.envs.gym_style_env import STOP_REASON_NAMES, GymStyleEnv, GymStyleInfo, StopReason
 from rl2.envs.visfly.routes import CATEGORIES
 from rl2.envs.visfly.scenarios import Manifest, Scenario
 from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv, VisFlyObservation, evaluation_manifest
@@ -334,6 +354,37 @@ class RolloutCarry(NamedTuple):
     episode_starts: jax.Array  # (B,)
     episode_returns: jax.Array  # (B,)
     episode_step_counts: jax.Array  # (B,)
+
+
+class RolloutInfoMetrics:
+    """Host summaries of step info, weighted by transitions or sampled starts."""
+
+    def __init__(self) -> None:
+        self.sums: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+
+    def _add_mean(self, name: str, values: NDArray[Any]) -> None:  # (N,)
+        if values.size:
+            self.sums[name] = self.sums.get(name, 0.0) + float(values.sum())
+            self.counts[name] = self.counts.get(name, 0) + values.size
+
+    def add(self, info: GymStyleInfo) -> None:
+        for name in ("power_ratio", "power_penalty"):
+            if name in info:
+                self._add_mean(name, info[name])
+        if "route_sampling" in info:
+            sampled = info["route_sampling"]
+            for name in ("initial_goal_distance_meters", "reference_route_length_meters"):
+                self._add_mean(name, sampled[name])
+            self._add_mean("direct_path_blocked_fraction", sampled["direct_path_blocked"])
+            for level in ("easy", "medium", "hard"):
+                self._add_mean(f"difficulty_fraction/{level}", sampled["difficulty"] == level)
+
+    def metrics(self) -> dict[str, float]:
+        metrics = {f"rollout/{name}": value / self.counts[name] for name, value in self.sums.items()}
+        if "initial_goal_distance_meters" in self.counts:
+            metrics["rollout/sampled_episode_count"] = self.counts["initial_goal_distance_meters"]
+        return metrics
 
 
 class RolloutResult(NamedTuple):
@@ -840,6 +891,7 @@ class EpisodeResult(NamedTuple):
     terminated: bool = False
     truncated: bool = False
     final_goal_distance: float | None = None
+    power_ratio: float | None = None
 
 
 @partial(jax.jit, static_argnames=("apply_fn",))
@@ -911,6 +963,8 @@ def play_episode(
     stop_reason = None
     terminated = truncated = False
     final_goal_distance = None
+    power_count = 0
+    power_ratio_sum = 0.0
     memory = initial_carry  # leaves: (1, H)
     starts = jnp.ones(1, dtype=bool)  # (1,)
     with (
@@ -936,6 +990,9 @@ def play_episode(
             observations = jax.device_put(transition.observations)  # leaves: (1, *O)
             episode_return += float(transition.rewards[0])
             length += 1
+            if transition.info is not None and "power_ratio" in transition.info:
+                power_count += 1
+                power_ratio_sum += float(transition.info["power_ratio"][0])
             if bool((transition.terminated | transition.truncated)[0]):
                 terminated = bool(transition.terminated[0])
                 truncated = bool(transition.truncated[0])
@@ -970,6 +1027,7 @@ def play_episode(
         terminated=terminated,
         truncated=truncated,
         final_goal_distance=final_goal_distance,
+        power_ratio=power_ratio_sum / length if power_count == length and length else None,
     )
 
 
@@ -1149,6 +1207,7 @@ def log_evaluation(
                     if episode.final_goal_distance is not None
                     else {}
                 ),
+                **({"power_ratio": episode.power_ratio} if episode.power_ratio is not None else {}),
             }
             for episode in episodes
         ],
@@ -1176,6 +1235,9 @@ def log_evaluation(
     distances = [episode.final_goal_distance for episode in episodes if episode.final_goal_distance is not None]
     if len(distances) == len(episodes):
         scalars["eval/final_goal_distance_meters"] = fmean(distances)
+    powers = [episode.power_ratio for episode in episodes if episode.power_ratio is not None]
+    if len(powers) == len(episodes):
+        scalars["eval/power_ratio"] = fmean(powers)
     if std is not None:
         scalars.update({"eval/return_std": std, "eval/return_sem": result["return_sem"]})
     if manifest is not None:
@@ -1291,11 +1353,13 @@ def collect_rollout(
     envs: PPOEnv,
     config: Config,
     key: jax.Array,  # () typed PRNG key
+    info_metrics: RolloutInfoMetrics | None = None,
 ) -> tuple[RolloutCarry, RolloutResult]:
     """Collect (B, T, ...) transitions with host environments and JAX policy/GAE.
 
     Timeouts bootstrap from final observations; both end flags reset recurrence.
     Completed episode returns, lengths, and count are reduced to scalars on device.
+    When supplied, info_metrics accumulates optional step measurements on the host.
     """
 
     class Transition(NamedTuple):
@@ -1328,6 +1392,8 @@ def collect_rollout(
         )
         key = sampled.key  # ()
         transition = envs.step(jax.device_get(sampled.actions))
+        if info_metrics is not None and transition.info is not None:
+            info_metrics.add(transition.info)
         # End flags originate on the host; checking them here avoids a device scalar readback.
         timeout = transition.truncated & ~transition.terminated  # (B,)
         observations, raw_rewards, episode_ends = jax.device_put(
@@ -1513,9 +1579,10 @@ def train_step(
     key: jax.Array,  # () typed PRNG key
     metrics: TrainingMetrics,  # scalar leaves
     schedule_index: int | jax.Array = 0,  # () completed environment steps // batch size
+    info_metrics: RolloutInfoMetrics | None = None,
 ) -> TrainStepResult:
     """Collect on the host, then run compiled PPO epochs over the collected batch."""
-    rollout_carry, rollout = collect_rollout(rollout_carry, train_state, envs, config, key)
+    rollout_carry, rollout = collect_rollout(rollout_carry, train_state, envs, config, key, info_metrics)
     return optimize_rollout(rollout_carry, rollout, train_state, config, metrics, schedule_index)
 
 
@@ -1607,13 +1674,14 @@ def train(config: Config) -> TrainState:
         rollout_carry = jax.device_put(rollout_carry, batched)  # leaves: (B, ...)
 
         window_start = monotonic()
+        info_metrics = RolloutInfoMetrics()
         window_start_step_count = initial_step_count
         planned_rollout_count = start_rollout_index + max(config.total_steps - initial_step_count, 0) // batch_size
         step_count = initial_step_count
         for rollout_index in range(start_rollout_index, planned_rollout_count):
             schedule_index = step_count // batch_size
             train_state, rollout_carry, key, metrics = train_step(
-                rollout_carry, train_state, envs, config, key, metrics, schedule_index
+                rollout_carry, train_state, envs, config, key, metrics, schedule_index, info_metrics=info_metrics
             )  # memory: (B, H); key/metrics: ()
             rollout_count = rollout_index + 1
             is_final_rollout = rollout_count == planned_rollout_count
@@ -1698,8 +1766,7 @@ def train(config: Config) -> TrainState:
                 if episode_count:
                     scalars["train/return"] = float(total.episode_return_sum) / episode_count
                     scalars["train/episode_length_steps"] = int(total.episode_length_sum) / episode_count
-                if isinstance(envs, VisFlyEnv) and config.env.route_sampling is not None:
-                    scalars.update(envs.backend.sampling_metrics())
+                scalars.update(info_metrics.metrics())
                 writer.log_metrics(scalars, step_count)
                 episode_return_text = f"{scalars['rollout/return']:.1f}" if window_episode_count else "n/a"
                 episode_length_text = (
@@ -1727,6 +1794,7 @@ def train(config: Config) -> TrainState:
                     flush=True,
                 )
                 window_start = now
+                info_metrics = RolloutInfoMetrics()
                 window_start_step_count = step_count
                 with jax.enable_x64():
                     metrics = metrics._replace(window=RunningSum.init(metrics.window))  # scalar leaves

@@ -19,6 +19,7 @@ from numpy.typing import NDArray
 from rl2.envs import visfly_env
 from rl2.envs.visfly.catalogues import PlannedCatalogue, planning_seed
 from rl2.envs.visfly.errors import NoSamplingVolumeError
+from rl2.envs.visfly.power import PowerUsage
 from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.scenarios import Scenario
 from rl2.envs.visfly.sensors import SharedRgbdRenderer
@@ -256,6 +257,48 @@ def test_navigation_nonterminal_collision_has_no_penalty(navigation_class: type[
     reward = env.get_reward()  # (B,)
     assert reward.shape == (1,)
     torch.testing.assert_close(reward, env.base_reward)
+
+
+@pytest.mark.parametrize(
+    ("energy_weight", "excess_weight"),
+    [(0.0, 0.0), (2.0, 0.0), (0.0, 3.0), (2.0, 3.0)],
+    ids=["diagnostics_only", "energy", "excess", "combined"],
+)
+def test_navigation_power_penalty_and_reset(
+    navigation_class: type[Any], energy_weight: float, excess_weight: float
+) -> None:
+    env = navigation_class(power={"energy_weight": energy_weight, "excess_power_weight": excess_weight})
+    torch.testing.assert_close(env.get_reward(), env.base_reward)
+    usage = PowerUsage(
+        energy=torch.tensor([0.02, 0.04]),  # (B,)
+        excess=torch.tensor([0.0, 0.01]),  # (B,)
+    )
+    env._power_meter.power_usage = usage
+    expected = env.base_reward - energy_weight * usage.energy - excess_weight * usage.excess  # (B,)
+    reward = env.get_reward()  # (B,)
+    assert reward.shape == (2,)
+    torch.testing.assert_close(reward, expected)
+    # Reading rewards is side-effect free; partial autoresets retain terminal consumption.
+    env.reset_agent_by_id(torch.tensor([0]))
+    assert env.power_usage is usage
+    torch.testing.assert_close(env.get_reward(), expected)
+    env.reset()
+    assert env.power_usage is None
+    torch.testing.assert_close(env.get_reward(), env.base_reward)
+
+
+def test_navigation_power_and_terminal_failure_costs_combine(navigation_class: type[Any]) -> None:
+    env = navigation_class(failure_penalty=20.0, power={"energy_weight": 2.0})
+    env._power_meter.power_usage = PowerUsage(
+        energy=torch.tensor([0.02, 0.04]),  # (B,)
+        excess=torch.zeros(2),  # (B,)
+    )
+    env._episode_done = torch.zeros(2, dtype=torch.bool)  # (B,)
+    env._success = torch.tensor([False, True])  # (B,)
+    env._failure = torch.ones(2, dtype=torch.bool)  # (B,)
+    env.is_out_bounds = env.is_collision = torch.zeros(2, dtype=torch.bool)  # (B,)
+    env.is_collision_reset = True
+    torch.testing.assert_close(env.get_reward(), env.base_reward - torch.tensor([20.04, 0.08]))
 
 
 @pytest.mark.parametrize("penalty", [-1.0, float("nan"), float("inf")], ids=["negative", "nan", "infinite"])
@@ -659,7 +702,7 @@ def test_fixed_scenario_pins_scene_state_and_partial_reset_targets(navigation_cl
         env.envs.stateGenerators[0].safe_generate()
 
 
-def test_route_catalogues_refresh_on_scene_rotation_and_metrics_drain(navigation_class: type[Any]) -> None:
+def test_route_catalogues_refresh_on_scene_rotation_and_record_sampled_starts(navigation_class: type[Any]) -> None:
     config = RouteConfig(spacing=3, sources=2, goals_per_source=3, jitter=0)
     env = navigation_class(scene_randomization=True, route_sampling=asdict(config))
     manager = env.envs.sceneManager
@@ -676,13 +719,7 @@ def test_route_catalogues_refresh_on_scene_rotation_and_metrics_drain(navigation
         second = env.route_catalogue(0, config, training=True)
     assert second is not first
     assert all(route.points[0][0] >= 10 for route in second)
-    metrics = env.sampling_metrics()
-    assert metrics["rollout/sampled_episode_count"] == 1
-    assert metrics["rollout/reference_route_length_meters"] == sampled.length
-    assert metrics["rollout/direct_path_blocked_fraction"] == 0
-    assert metrics["rollout/difficulty_fraction/hard"] == 0
-    assert sum(metrics[f"rollout/difficulty_fraction/{level}"] for level in ("easy", "medium", "hard")) == 1
-    assert env.sampling_metrics() == {}
+    assert env.sampled_routes == [sampled]
 
 
 def test_route_catalogue_modes_do_not_share_cached_metadata(navigation_class: type[Any]) -> None:

@@ -18,6 +18,7 @@ from rl2.envs.visfly.catalogues import build_catalogue, planning_seed
 from rl2.envs.visfly.collision import SceneCollision, collision_points
 from rl2.envs.visfly.generate_manifest import generate_manifest
 from rl2.envs.visfly.planning import build_roadmap, build_routes, sample_route, segments_clear
+from rl2.envs.visfly.power import PowerConfig
 from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.sampling import sampling_bounds
 from rl2.envs.visfly.scenarios import EvaluationConfig
@@ -397,7 +398,10 @@ def test_compiled_physics_matches_upstream_through_autoresets(num_envs: int, del
     actions = np.random.default_rng(7).uniform(-0.1, 0.1, size=(10, num_envs, 4)).astype(np.float32)  # (T, B, A)
     traces = []
     for compiled in (False, True):
-        config = VisFlyConfig(kwargs={**kwargs, "compiled_dynamics": compiled})
+        config = VisFlyConfig(
+            kwargs={**kwargs, "compiled_dynamics": compiled},
+            power=PowerConfig(energy_weight=0.05, excess_power_weight=0.1),
+        )
         with (
             jax.set_mesh(Mesh(devices=np.array(jax.devices()), axis_names=("trainer",))),
             closing(VisFlyEnv(config=config, num_envs=num_envs, seed=19)) as env,
@@ -414,3 +418,6 @@ def test_compiled_physics_matches_upstream_through_autoresets(num_envs: int, del
         np.testing.assert_allclose(actual.rewards, expected.rewards, atol=2e-5, rtol=2e-5)
         np.testing.assert_array_equal(actual.terminated, expected.terminated)
         np.testing.assert_array_equal(actual.truncated, expected.truncated)
+        for key in ("energy_hover_seconds", "power_ratio", "power_penalty"):
+            assert actual.info[key].shape == (num_envs,)
+            np.testing.assert_allclose(actual.info[key], expected.info[key], atol=2e-5, rtol=2e-5)

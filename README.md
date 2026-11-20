@@ -126,6 +126,24 @@ rendering; `eval_video: true` or a positive `video_interval` requires appropriat
 `scene_kwargs.render_settings`. Checkpoints save the full configuration, but resume
 uses the current configuration and starts fresh environments and recurrent memory.
 
+`env.power` enables uncalibrated efficiency shaping. Per-substep power is
+`mean((max(rotor_thrust, 0) / (mass * 9.81 / 4)) ** 1.5)` across four rotors:
+1 represents balanced hover. Energy integrates this ratio over simulated seconds;
+one hover-equivalent second is the effort of hovering for one second, not joules.
+Both compiled and native dynamics measure actual motor thrust, including motor lag.
+The reward subtracts `energy_weight * energy` plus `excess_power_weight` times
+the integral of `max(power_ratio - power_threshold, 0) ** 2`.
+The preset starts with weights 0.05 and 0.1 and threshold 1.5; these require tuning
+against success rate. Set `env.power: null` to disable, or both weights to zero for
+measurement only. Observations and flight dynamics are unchanged; no battery is simulated.
+
+Training logs `rollout/power_ratio` and `rollout/power_penalty`.
+Evaluation logs `eval/power_ratio` (mean of episode means), plus per-episode report values.
+Compare power on the same evaluation routes alongside success rate and episode length.
+Consumption includes terminal actions, survives scene rotations in
+training windows, and is omitted when disabled. Full metric semantics are in the
+`train_ppo_gym.py` module docstring.
+
 The VisFly preset samples collision-checked routes with an easy/medium/hard mixture
 of 20/40/40: short clear flights, long clear flights, and obstacle-crossing flights.
 An OMPL PRM route catalogue is cached per loaded scene; endpoint jitter provides fresh
