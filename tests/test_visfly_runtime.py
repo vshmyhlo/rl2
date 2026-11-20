@@ -5,17 +5,21 @@ from contextlib import closing
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
+from typing import Any, NamedTuple
 
 import jax
 import numpy as np
 import pytest
 import torch
 from jax.sharding import Mesh
+from numpy.typing import NDArray
 
+from rl2.envs.visfly.catalogues import build_catalogue, planning_seed
 from rl2.envs.visfly.collision import SceneCollision, collision_points
 from rl2.envs.visfly.generate_manifest import generate_manifest
 from rl2.envs.visfly.planning import build_roadmap, build_routes, sample_route, segments_clear
-from rl2.envs.visfly.routes import RouteConfig
+from rl2.envs.visfly.routes import Route, RouteConfig
+from rl2.envs.visfly.sampling import sampling_bounds
 from rl2.envs.visfly.scenarios import EvaluationConfig
 from rl2.envs.visfly.sensors import SharedRgbdRenderer
 from rl2.envs.visfly_env import evaluation_manifest
@@ -24,6 +28,87 @@ from rl2.envs.visfly_env import evaluation_manifest
 from rl2.train_ppo_gym import VisFlyConfig, VisFlyEnv
 
 pytestmark = pytest.mark.skipif(os.environ.get("RL2_VISFLY_TESTS") != "1", reason="requires the VisFly GPU image")
+
+
+class PlanningRecord(NamedTuple):
+    reset: dict[str, NDArray[Any]]  # leaves: (B, *O)
+    step: dict[str, NDArray[Any]]  # leaves: (B, *O)
+    routes: list[list[Route]]
+
+
+def test_parallel_prefetch_matches_serial_planning_and_live_geometry() -> None:
+    root = Path(os.environ["VISFLY_SCENE_PATH"])
+    base = VisFlyConfig(
+        num_scenes=2,
+        scene_rotation_env_steps=128,
+        route_sampling=RouteConfig(spacing=8, sources=3, goals_per_source=3, min_distance=1),
+        kwargs={
+            "device": "cpu",
+            "scene_randomization": True,
+            "max_episode_steps": 1,
+            "scene_kwargs": {"path": str(root), "scene_type": "json"},
+            "sensor_kwargs": [
+                {"sensor_type": "COLOR", "uuid": "color", "resolution": [16, 16]},
+                {"sensor_type": "DEPTH", "uuid": "depth", "resolution": [16, 16]},
+            ],
+        },
+    )
+    runs = []
+    for workers, prefetch in ((1, False), (2, True)):
+        config = replace(base, kwargs={**base.kwargs, "planning_workers": workers, "planning_prefetch": prefetch})
+        records = []
+        with closing(VisFlyEnv(config=config, num_envs=4, seed=7)) as env:
+            manager = env.backend.envs.sceneManager
+            loader = manager._scene_loader
+            loader.paths = [
+                str(root / scene)
+                for scene in (
+                    "garage_empty/garage_empty_0.scene_instance.json",
+                    "box30_high_low/box30_high_low_8.scene_instance.json",
+                )
+            ]
+            loader._select_index = [0, 1]
+            loader._current_index = 0
+            for generation in range(2):
+                observations = env.reset()  # leaves: (4, *O)
+                assert observations["state"].shape == (4, 13)
+                assert observations["target"].shape == (4, 3)
+                assert observations["rgb"].shape == (4, 16, 16, 3)
+                assert observations["depth"].shape == (4, 16, 16, 1)
+                catalogues = [env.backend._route_catalogues[index] for index in range(2)]
+                if generation == 0:
+                    for index, catalogue in enumerate(catalogues):
+                        # _load_planned_scenes already advanced the generation counter.
+                        task = replace(
+                            env.backend._planning_task(index, loader.paths[index]),
+                            seed=planning_seed(7, generation, index),
+                        )
+                        bounds = sampling_bounds(manager._scene_bounds[index], 0.3, (0.5, 2.5))
+                        reference = build_catalogue(task, bounds, SceneCollision(scene=manager.scenes[index]))
+                        assert catalogue.routes == reference.routes
+                        assert catalogue.long_threshold == reference.long_threshold
+                transition = env.step(np.zeros((4, 4), dtype=np.float32))  # (B, A)
+                assert transition.terminated.shape == (4,) and transition.truncated.all()
+                records.append(
+                    PlanningRecord(
+                        reset=observations,  # leaves: (4, *O)
+                        step=transition.observations,  # leaves: (4, *O)
+                        routes=[catalogue.routes for catalogue in catalogues],
+                    )
+                )
+                if prefetch:
+                    pending = env.backend._planner._pending
+                    assert len(pending) == 2
+                    for future in pending.values():
+                        future.result()
+            assert records[0].routes != records[1].routes, "revisiting a scene must use a fresh catalogue"
+        assert env.backend._planner is None
+        runs.append(records)
+    for serial, parallel in zip(*runs, strict=True):
+        for serial_obs, parallel_obs in ((serial.reset, parallel.reset), (serial.step, parallel.step)):
+            for key in serial_obs:
+                np.testing.assert_array_equal(serial_obs[key], parallel_obs[key])
+        assert serial.routes == parallel.routes
 
 
 def test_shared_rgbd_matches_separate_passes_across_reload_and_video() -> None:

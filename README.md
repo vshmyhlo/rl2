@@ -130,6 +130,15 @@ The VisFly preset samples collision-checked routes with an easy/medium/hard mixt
 of 20/40/40: short clear flights, long clear flights, and obstacle-crossing flights.
 An OMPL PRM route catalogue is cached per loaded scene; endpoint jitter provides fresh
 starts/goals. Missing difficulty levels are excluded and weights renormalized.
+The preset uses `env.kwargs.planning_workers: 4` CPU processes and
+`planning_prefetch: true` to prepare one rotation ahead. Workers load static
+collision geometry without cameras. Each scene visit gets a fresh catalogue
+from a deterministic seed independent of episode sampling; worker count and
+completion order do not affect results. This changes the old shared RNG sequence.
+Set `planning_prefetch: false` to measure foreground parallel planning, or
+`planning_workers: 0` for the original synchronous path. Parallel planning
+requires static scenes; pending work is canceled and running workers joined on
+close. Fixed-manifest evaluation does not start planning workers.
 OMPL 2.0.1 requires Python 3.12 or 3.13. It supplies roadmap construction,
 probe counts, and deterministic rope shortcutting; SciPy supplies
 shortest paths and extra-clearance connectivity. Training skips passage classification

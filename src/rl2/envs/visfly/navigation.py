@@ -4,6 +4,7 @@ import logging
 from collections import Counter
 from collections.abc import Callable
 from contextlib import ExitStack, closing
+from copy import copy
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -15,37 +16,19 @@ import torch
 from habitat_sim import SensorType
 from pydantic import TypeAdapter
 from VisFly.envs.NavigationEnv import NavigationEnv
-from VisFly.utils.common import habitat_to_std
 from VisFly.utils.maths import Quaternion
 from VisFly.utils.type import TensorDict
 
+from rl2.envs.visfly.catalogues import CataloguePlanner, PlanningTask, planning_seed
 from rl2.envs.visfly.collision import SceneCollision
 from rl2.envs.visfly.dynamics import CompiledEuler
 from rl2.envs.visfly.errors import NoSamplingVolumeError
 from rl2.envs.visfly.planning import build_roadmap, build_routes, sample_route, segments_clear
+from rl2.envs.visfly.planning_worker import plan_scene
 from rl2.envs.visfly.routes import Route, RouteConfig
-from rl2.envs.visfly.sampling import sample_positions
+from rl2.envs.visfly.sampling import sample_positions, sampling_bounds
 from rl2.envs.visfly.scenarios import Scenario
 from rl2.envs.visfly.sensors import SharedRgbdRenderer
-
-
-class SamplingBounds(NamedTuple):
-    lower: torch.Tensor  # (3,)
-    upper: torch.Tensor  # (3,)
-
-
-def sampling_bounds(bounds: Any, clearance: float, height: tuple[float, float]) -> SamplingBounds:
-    """Return (3,) bounds within dynamics limits; height is relative to the scene AABB floor."""
-    corners, _ = habitat_to_std(np.array([bounds.min, bounds.max]))  # (2, 3)
-    lower = corners.amin(dim=0) + clearance  # (3,)
-    upper = corners.amax(dim=0) - clearance  # (3,)
-    floor = corners[:, 2].min()  # ()
-    lower[2] = torch.maximum(lower[2], floor + height[0])
-    upper[2] = torch.minimum(upper[2], floor + height[1])
-    # Match Dynamics._ugly_fix in pinned VisFly; starts and goals must survive its position clamp.
-    lower = torch.maximum(lower, lower.new_tensor([-100.0, -100.0, 0.0]))  # (3,)
-    upper = torch.minimum(upper, upper.new_tensor([100.0, 100.0, 20.0]))  # (3,)
-    return SamplingBounds(lower=lower, upper=upper)
 
 
 class SampledState(NamedTuple):
@@ -174,6 +157,8 @@ class RGBNavigationEnv(NavigationEnv):
         scene_path: str | None = None,
         compiled_dynamics: bool = True,
         shared_rgbd: bool = True,
+        planning_workers: int = 0,
+        planning_prefetch: bool = True,
         **kwargs: Any,
     ) -> None:
         if kwargs.get("dynamics_kwargs", {}).get("ori_output_type", "quaternion") != "quaternion":
@@ -192,6 +177,11 @@ class RGBNavigationEnv(NavigationEnv):
         self.scenario = TypeAdapter(Scenario).validate_python(scenario) if scenario is not None else None
         if (self.route_config is not None or self.scenario is not None) and not scene_randomization:
             raise ValueError("Route sampling and fixed scenarios require scene_randomization=True")
+        if planning_workers < 0:
+            raise ValueError("planning_workers must be nonnegative")
+        self._planner: CataloguePlanner | None = None
+        self._planning_generation = 0
+        self._planning_prefetch = planning_prefetch
         self._route_catalogues: dict[int, RouteCatalogue] = {}
         self._initial_scene_objects: dict[int, tuple[Any, list[Any]]] = {}
         self._wind_settings = kwargs.get("dynamics_kwargs", {}).get("wind_settings", [0, 0, 0])
@@ -291,7 +281,67 @@ class RGBNavigationEnv(NavigationEnv):
                     )
                     for index, base in enumerate(self.envs.stateGenerators)
                 ]
+            if planning_workers and self.route_config is not None and self.scenario is None:
+                if manager.obj_settings:
+                    raise ValueError("Parallel route planning requires static scene geometry")
+                self._planner = CataloguePlanner(workers=planning_workers, worker=plan_scene)
+                self._load_unplanned_scenes = manager.load_scenes
+                manager.load_scenes = self._load_planned_scenes
             resources.pop_all()
+
+    def _planning_task(self, scene_id: int, path: str) -> PlanningTask:
+        manager = self.envs.sceneManager
+        assert self.route_config is not None
+        return PlanningTask(
+            scene_path=path,
+            dataset_path=manager._datasets_path,
+            seed=planning_seed(manager.seed, self._planning_generation, scene_id),
+            clearance=self.spawn_clearance,
+            height=tuple(self.flight_height),
+            config=self.route_config,
+            scene_seed=manager.seed,
+        )
+
+    def _submit_next_scenes(self) -> None:
+        assert self._planner is not None
+        manager = self.envs.sceneManager
+        # Peek without advancing the loader, including at inventory wraparound.
+        paths = copy(manager._scene_loader).next(manager.num_scene)
+        self._planner.submit(
+            [
+                self._planning_task(scene_id, path)
+                for scene_id, path in enumerate(paths)
+                if path not in self._rejected_scenes
+            ]
+        )
+
+    def _load_planned_scenes(self, indices: Any = None) -> None:
+        """Overlap fresh planning with scene loading; prefetch one future rotation."""
+        assert self._planner is not None and self.route_config is not None
+        manager = self.envs.sceneManager
+        if indices is None:
+            self._submit_next_scenes()
+        self._load_unplanned_scenes(indices=indices)
+        selected = range(manager.num_scene) if indices is None else np.atleast_1d(indices).tolist()
+        tasks = {
+            scene_id: self._planning_task(scene_id, manager.scenes[scene_id].config.sim_cfg.scene_id)
+            for scene_id in selected
+        }
+        # A rejected scene may have advanced the loader beyond the prefetched set.
+        self._planner.submit(list(tasks.values()))
+        for scene_id, task in tasks.items():
+            result = self._planner.take(task)
+            self._route_catalogues[scene_id] = RouteCatalogue(
+                scene=manager.scenes[scene_id],
+                config=self.route_config,
+                training=True,
+                routes=result.routes,
+                long_threshold=result.long_threshold,
+            )
+        self._planner.discard()
+        self._planning_generation += 1
+        if self._planning_prefetch and self.envs._scene_iter:
+            self._submit_next_scenes()
 
     def configure_scenario(self, scenario: Scenario) -> None:
         """Select deterministic conditions, retaining loaded geometry within a scene."""
@@ -500,6 +550,9 @@ class RGBNavigationEnv(NavigationEnv):
 
     def close(self) -> None:
         """Release dynamics and loaded scenes, including before the first successful reset."""
+        if self._planner is not None:
+            self._planner.close()
+            self._planner = None
         self.envs.dynamics.close()
         # The first scene owns the shared GL context; release its dependents first.
         scenes = self.envs.sceneManager.scenes

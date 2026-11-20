@@ -1,10 +1,32 @@
 """Bounded collision-free position sampling for host-stepped VisFly scenes."""
 
 from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
 from numpy.typing import NDArray
+
+
+class SamplingBounds(NamedTuple):
+    lower: torch.Tensor  # (3,)
+    upper: torch.Tensor  # (3,)
+
+
+def sampling_bounds(bounds: Any, clearance: float, height: tuple[float, float]) -> SamplingBounds:
+    """Return (3,) flight bounds in VisFly coordinates, above the scene AABB floor."""
+    corners = torch.as_tensor(
+        np.array([bounds.min, bounds.max])[:, [2, 0, 1]] * [-1, -1, 1], dtype=torch.float32
+    )  # (2, 3)
+    lower = corners.amin(dim=0) + clearance  # (3,)
+    upper = corners.amax(dim=0) - clearance  # (3,)
+    floor = corners[:, 2].min()  # ()
+    lower[2] = torch.maximum(lower[2], floor + height[0])
+    upper[2] = torch.minimum(upper[2], floor + height[1])
+    # Match the position clamp in pinned VisFly's Dynamics._ugly_fix.
+    lower = torch.maximum(lower, lower.new_tensor([-100.0, -100.0, 0.0]))  # (3,)
+    upper = torch.minimum(upper, upper.new_tensor([100.0, 100.0, 20.0]))  # (3,)
+    return SamplingBounds(lower=lower, upper=upper)
 
 
 def sample_positions(

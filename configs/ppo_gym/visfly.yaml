@@ -14,6 +14,8 @@ env:
   kwargs:
     device: cpu # VisFly tensors/dynamics; Habitat still renders on GPU alongside JAX
     visual: true
+    planning_workers: 4 # Independent CPU processes; fresh catalogues per scene visit
+    planning_prefetch: true # Prepare the next rotation while the current scenes train
     shared_rgbd: true # One draw for aligned RGB/depth; separate passes for incompatible sensors or video
     max_episode_steps: 1500 # 30 seconds at 50 Hz; evaluation uses each saved route budget
     failure_penalty: 0.0 # Subtract once on terminal failure; 0 disables. Success and truncation alone are exempt.

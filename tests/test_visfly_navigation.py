@@ -17,6 +17,7 @@ import torch
 from numpy.typing import NDArray
 
 from rl2.envs import visfly_env
+from rl2.envs.visfly.catalogues import PlannedCatalogue, planning_seed
 from rl2.envs.visfly.errors import NoSamplingVolumeError
 from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.scenarios import Scenario
@@ -706,3 +707,81 @@ def test_route_catalogue_modes_do_not_share_cached_metadata(navigation_class: ty
         assert env.route_catalogue(0, config) == [detailed]
     assert [call.kwargs["classify_passages"] for call in graph.call_args_list] == [True, False, True]
     assert [call.kwargs["shortcut"] for call in routes.call_args_list] == [True, False, True]
+
+
+class SceneLoaderStub:
+    def __init__(self, paths: list[str]) -> None:
+        self.paths = paths
+        self._current_index = 0
+
+    def next(self, count: int) -> list[str]:
+        paths = [self.paths[(self._current_index + index) % len(self.paths)] for index in range(count)]
+        self._current_index = (self._current_index + count) % len(self.paths)
+        return paths
+
+
+def test_planning_handles_rejected_scene_and_peeks_without_advancing(navigation_class: type[Any]) -> None:
+    env = navigation_class(scene_randomization=True, route_sampling=asdict(RouteConfig()))
+    manager = env.envs.sceneManager
+    manager.num_scene = 2
+    manager.seed = 7
+    manager._datasets_path = "dataset.json"
+    manager._scene_loader = SceneLoaderStub(["bad.json", "a.json", "b.json"])
+    env.envs._scene_iter = True
+    planner = Mock()
+    planner.take.return_value = PlannedCatalogue(routes=[], long_threshold=3.0)
+    env._planner = planner
+
+    def load(indices: Any = None) -> None:
+        assert indices is None and manager._scene_loader._current_index == 0
+        paths = manager._scene_loader.next(2)
+        env._rejected_scenes[paths[0]] = "no sampling volume"
+        paths[0] = manager._scene_loader.next(1)[0]
+        manager.scenes = [
+            SimpleNamespace(config=SimpleNamespace(sim_cfg=SimpleNamespace(scene_id=p)), close=Mock()) for p in paths
+        ]
+
+    env._load_unplanned_scenes = load
+    with closing(env):
+        env._load_planned_scenes()
+        taken = [call.args[0] for call in planner.take.call_args_list]
+        assert [task.scene_path for task in taken] == ["b.json", "a.json"]
+        assert [task.seed for task in taken] == [planning_seed(7, 0, index) for index in range(2)]
+        next_tasks = planner.submit.call_args.args[0]
+        assert [task.scene_path for task in next_tasks] == ["a.json"]
+        assert next_tasks[0].seed == planning_seed(7, 1, 1)
+        assert manager._scene_loader._current_index == 0
+        assert env._route_catalogues[0].scene is manager.scenes[0]
+        assert env._route_catalogues[0].long_threshold == 3
+        planner.discard.assert_called_once_with()
+    planner.close.assert_called_once_with()
+    assert env._planner is None
+
+
+def test_negative_planning_workers_rejected(navigation_class: type[Any]) -> None:
+    with pytest.raises(ValueError, match="planning_workers"):
+        navigation_class(planning_workers=-1)
+
+
+def test_planning_workers_unused_without_training_routes(navigation_class: type[Any]) -> None:
+    planner = Mock(side_effect=AssertionError("must not start planning"))
+    with (
+        patch.dict(navigation_class.__init__.__globals__, CataloguePlanner=planner),
+        closing(navigation_class(planning_workers=4)) as env,
+    ):
+        assert env._planner is None
+    planner.assert_not_called()
+
+
+def test_parallel_planning_rejects_dynamic_geometry(navigation_class: type[Any]) -> None:
+    original = NavigationStub.__init__
+
+    def initialize(self: NavigationStub, **kwargs: Any) -> None:
+        original(self, **kwargs)
+        self.envs.sceneManager.obj_settings = {"path": "moving_objects"}
+
+    with (
+        patch.object(NavigationStub, "__init__", initialize),
+        pytest.raises(ValueError, match="static scene geometry"),
+    ):
+        navigation_class(scene_randomization=True, route_sampling=asdict(RouteConfig()), planning_workers=2)
