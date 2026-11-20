@@ -17,12 +17,78 @@ from rl2.envs.visfly.generate_manifest import generate_manifest
 from rl2.envs.visfly.planning import build_roadmap, build_routes, sample_route, segments_clear
 from rl2.envs.visfly.routes import RouteConfig
 from rl2.envs.visfly.scenarios import EvaluationConfig
+from rl2.envs.visfly.sensors import SharedRgbdRenderer
 from rl2.envs.visfly_env import evaluation_manifest
 
 # Exercise the trainer's native-library import order before constructing VisFly.
 from rl2.train_ppo_gym import VisFlyConfig, VisFlyEnv
 
 pytestmark = pytest.mark.skipif(os.environ.get("RL2_VISFLY_TESTS") != "1", reason="requires the VisFly GPU image")
+
+
+def test_shared_rgbd_matches_separate_passes_across_reload_and_video() -> None:
+    config = VisFlyConfig(
+        num_scenes=2,
+        scene_rotation_env_steps=128,
+        kwargs={
+            "device": "cpu",
+            "scene_randomization": True,
+            "max_episode_steps": 1,
+            "scene_kwargs": {
+                "path": os.environ["VISFLY_SCENE_PATH"],
+                "scene_type": "json",
+                "render_settings": {"sensor_type": "color", "mode": "follow", "view": "near", "resolution": [32, 32]},
+            },
+            "sensor_kwargs": [
+                {"sensor_type": "COLOR", "uuid": "color", "resolution": [32, 32]},
+                {"sensor_type": "DEPTH", "uuid": "depth", "resolution": [32, 32]},
+            ],
+        },
+    )
+    with closing(VisFlyEnv(config=config, num_envs=4, seed=7)) as env:
+        manager = env.backend.envs.sceneManager
+        loader = manager._scene_loader
+        loader.paths = [
+            str(Path(os.environ["VISFLY_SCENE_PATH"]) / scene)
+            for scene in (
+                "garage_empty/garage_empty_0.scene_instance.json",
+                "v3_sc0_staging_08.scene_instance.json",
+                "box30_high_low/box30_high_low_8.scene_instance.json",
+                "box30_wall_low/box30_wall_low_45.scene_instance.json",
+            )
+        ]
+        loader._select_index = list(range(4))
+        renderer = manager.get_observation
+        assert isinstance(renderer, SharedRgbdRenderer)
+        previous_scenes = tuple(manager.scenes)
+        for _ in range(2):
+            env.reset()
+            assert all(before is not after for before, after in zip(previous_scenes, manager.scenes, strict=True))
+            previous_scenes = tuple(manager.scenes)
+            assert renderer._groups, "test image must include RGB_DEPTH support"
+            for _ in range(2):
+                renderer._restore_targets()
+                reference = [
+                    {key: value.copy() for key, value in obs.items()} for obs in renderer._original()
+                ]  # leaves: (H, W, C) or (H, W)
+                renderer._prepare()
+                images = manager.get_observation()
+                for expected, actual in zip(reference, images, strict=True):
+                    for key in ("color", "depth"):
+                        np.testing.assert_array_equal(actual[key], expected[key])
+                selected = manager.get_observation(indices=torch.tensor([3, 0]))
+                for image, index in zip(selected, (3, 0), strict=True):
+                    np.testing.assert_array_equal(image["depth"], reference[index]["depth"])
+                assert manager.get_observation(indices=[]) == []
+                step = env.step(np.zeros((4, 4), dtype=np.float32))  # (B, A)
+                assert step.truncated.all()
+                assert step.observations["depth"].shape == (4, 32, 32, 1)
+        frame = env.render()  # (B, H, W, 3)
+        assert frame.shape[0] == 4 and not renderer._groups
+        separate = renderer._original()
+        after_video = manager.get_observation()
+        for expected, actual in zip(separate, after_video, strict=True):
+            np.testing.assert_array_equal(actual["depth"], expected["depth"])
 
 
 def test_native_collision_and_route_parity() -> None:

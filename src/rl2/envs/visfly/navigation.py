@@ -26,6 +26,7 @@ from rl2.envs.visfly.planning import build_roadmap, build_routes, sample_route, 
 from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.sampling import sample_positions
 from rl2.envs.visfly.scenarios import Scenario
+from rl2.envs.visfly.sensors import SharedRgbdRenderer
 
 
 class SamplingBounds(NamedTuple):
@@ -172,6 +173,7 @@ class RGBNavigationEnv(NavigationEnv):
         scenario: dict[str, Any] | None = None,
         scene_path: str | None = None,
         compiled_dynamics: bool = True,
+        shared_rgbd: bool = True,
         **kwargs: Any,
     ) -> None:
         if kwargs.get("dynamics_kwargs", {}).get("ori_output_type", "quaternion") != "quaternion":
@@ -245,6 +247,8 @@ class RGBNavigationEnv(NavigationEnv):
                 )
             self.observation_space.spaces["rgb"] = self.observation_space.spaces.pop("color")
             manager = self.envs.sceneManager
+            if shared_rgbd and self.has_depth:
+                SharedRgbdRenderer(manager)
             loader = manager._scene_loader
             root = Path(manager.root_path)
             loader.paths = [

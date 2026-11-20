@@ -1,0 +1,34 @@
+--- a/src/esp/gfx/Renderer.h
++++ b/src/esp/gfx/Renderer.h
+@@ -35,6 +35,9 @@
+      * see bindRenderTarget for more info.
+      */
+     VisualizeTexture = 1 << 1,
++
++    /** Enable metric depth readback from a color sensor. */
++    RgbDepth = 1 << 5,
+ 
+     /**
+      * Use a background renderer to overlap rendering with physics simulation.
+--- a/src/esp/gfx/Renderer.cpp
++++ b/src/esp/gfx/Renderer.cpp
+@@ -340,6 +340,9 @@
+             "render buffer while the simulator was initialized with "
+             "requiresTextures = false", );
+         renderTargetFlags |= RenderTarget::Flag::RgbaAttachment;
++        if (bindingFlags & Flag::RgbDepth) {
++          renderTargetFlags |= RenderTarget::Flag::DepthTextureAttachment;
++        }
+         // TODO complete support for other camera types (fisheye,
+         // equirectanguular) to use hbao.
+         if ((sensor.canUseHBAO()) &&
+--- a/src/esp/bindings/GfxBindings.cpp
++++ b/src/esp/bindings/GfxBindings.cpp
+@@ -83,6 +83,7 @@
+   py::enum_<Renderer::Flag> rendererFlags{renderer, "Flags", "Flags"};
+ 
+   rendererFlags.value("VISUALIZE_TEXTURE", Renderer::Flag::VisualizeTexture)
++      .value("RGB_DEPTH", Renderer::Flag::RgbDepth)
+       .value("NONE", Renderer::Flag{});
+   pybindEnumOperators(rendererFlags);
+ 

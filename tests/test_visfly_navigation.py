@@ -20,6 +20,7 @@ from rl2.envs import visfly_env
 from rl2.envs.visfly.errors import NoSamplingVolumeError
 from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.scenarios import Scenario
+from rl2.envs.visfly.sensors import SharedRgbdRenderer
 
 
 def habitat_to_std(corners: NDArray[Any]) -> tuple[torch.Tensor, None]:  # (2, 3) -> (2, 3)
@@ -92,6 +93,8 @@ class NavigationStub:
                 _load_scene=Mock(),
                 _scene_bounds=[SimpleNamespace(min=[-10, 0, -10], max=[0, 4, 0])] * 2,
                 get_point_is_collision=collision_free,
+                get_observation=Mock(),
+                render=Mock(),
             ),
             stateGenerators=[GeneratorStub(), GeneratorStub()],
         )
@@ -534,6 +537,7 @@ def test_rgb_terminal_image_survives_sensor_buffer_reuse(navigation_class: type[
             {"sensor_type": "DEPTH", "uuid": "depth", "resolution": [2, 4]},
         ]
     )
+    assert isinstance(env.envs.sceneManager.get_observation, SharedRgbdRenderer)
     observation = env.get_observation()  # leaves: (B, *O)
     assert set(observation) == set(env.observation_space.spaces) == {"state", "target", "rgb", "depth"}
     assert observation["depth"].dtype == torch.float32
@@ -551,6 +555,17 @@ def test_rgb_terminal_image_survives_sensor_buffer_reuse(navigation_class: type[
     np.testing.assert_array_equal(terminal_depth.numpy(), 7)
     np.testing.assert_array_equal(after_reset["depth"][0].numpy(), 20)
     np.testing.assert_array_equal(after_reset["depth"][1].numpy(), 7)
+
+
+def test_shared_rgbd_can_be_disabled(navigation_class: type[Any]) -> None:
+    env = navigation_class(
+        shared_rgbd=False,
+        sensor_kwargs=[
+            {"sensor_type": "COLOR", "uuid": "color", "resolution": [2, 4]},
+            {"sensor_type": "DEPTH", "uuid": "depth", "resolution": [2, 4]},
+        ],
+    )
+    assert isinstance(env.envs.sceneManager.get_observation, Mock)
 
 
 @pytest.mark.parametrize("setting", ["resolution", "position", "orientation"])

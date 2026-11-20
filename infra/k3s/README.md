@@ -619,9 +619,16 @@ Tune the budget for peak PPO, scene rotation, and evaluation usage. To override 
 ./submit.py --visfly -- env XLA_CLIENT_MEM_FRACTION=0.60 uv run python -m rl2.train_ppo_gym --config configs/ppo_gym/visfly.yaml
 ```
 
-The VisFly adapter uses RGB-only navigation observations: `state`, `target`, and
-`rgb` (uint8, channels-last). Configure one `COLOR` sensor with UUID `color`;
-the example uses 64×64 pixels. `visual` must remain enabled.
+The VisFly adapter returns `state`, `target`, `rgb` (uint8, channels-last), and
+optional `depth` (float32 metres). Configure a `COLOR` sensor named `color` and
+an optional aligned `DEPTH` sensor named `depth`; the preset uses 64×64 RGB-D.
+`visual` must remain enabled.
+The VisFly image includes a shared RGB/depth draw pass, enabled by default with
+`env.kwargs.shared_rgbd: true`. It supports fixed, aligned CPU pinhole sensors
+with matching projection and no noise or HBAO. Unsupported rigs and older images
+use separate passes. Video rendering restores separate passes for that environment
+to keep diagnostic overlays out of depth observations. Set `shared_rgbd: false`
+to force the original renderer; rebuild the VisFly image to install native support.
 The built-in navigation reward requires quaternion state (`ori_output_type: quaternion`).
 Each adapter isolates its CPU Torch RNG, so evaluation does not alter training resets.
 

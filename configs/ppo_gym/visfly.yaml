@@ -8,12 +8,13 @@ env:
     spacing: 0.75 # Metres; uniform PRM sample density, cached per loaded scene
     jitter: 0.2 # Metres; validated endpoint perturbations at each reset
   evaluation:
-    manifest_path: data/visfly/eval_manifest.json # Required: generate offline before training
+    manifest_path: /runs/visfly/eval_manifest.json # Shared job volume; generate offline before training
     reference_speed: 1.0 # m/s for route-length-based time budgets
     maneuver_seconds: 10.0
   kwargs:
     device: cpu # VisFly tensors/dynamics; Habitat still renders on GPU alongside JAX
     visual: true
+    shared_rgbd: true # One draw for aligned RGB/depth; separate passes for incompatible sensors or video
     max_episode_steps: 1500 # 30 seconds at 50 Hz; evaluation uses each saved route budget
     failure_penalty: 0.0 # Subtract once on terminal failure; 0 disables. Success and truncation alone are exempt.
     scene_randomization: true
@@ -85,7 +86,7 @@ entropy_coef: 0.001
 max_grad_norm: 0.5
 video_fps: 50.0
 video_interval: 0 # Record videos only during evaluation
-eval_interval: 100
+eval_interval: 500
 eval_episodes: null # Required with env.evaluation; use a positive count only when env.evaluation is null
 eval_video: true
 run_id: ppo_gym_visfly_rgbd_ne${num_envs}_ns${num_steps}_mb${num_minibatches}_ue${update_epochs}_fp${env.kwargs.failure_penalty}_seed${seed}
