@@ -13,6 +13,8 @@ RUN sed -i 's/numpy>=1.20.0,<1.24.0/numpy>=2,<3/' requirements.txt
 COPY infra/k3s/training/visfly/route_collision.h /opt/habitat-sim/src/esp/bindings/route_collision.h
 COPY infra/k3s/training/visfly/route_collision.patch /tmp/visfly/route_collision.patch
 RUN patch --strip=1 < /tmp/visfly/route_collision.patch
+COPY infra/k3s/training/visfly/rgbd.patch /tmp/visfly/rgbd.patch
+RUN patch --strip=1 < /tmp/visfly/rgbd.patch
 RUN --mount=type=cache,target=/opt/habitat-sim/build,sharing=locked \
     python setup.py --headless --bullet --no-update-submodules --skip-install-magnum \
     --build-type Release \
@@ -95,7 +97,7 @@ ENV PYTHONPATH=/opt VISFLY_SCENE_PATH=/opt/VisFly/datasets/visfly-beta/configs/s
 # Use TensorBoard's no-TensorFlow mode for PyTorch logging. Loading TensorFlow
 # before Triton introduces conflicting native compiler libraries.
 RUN touch /app/.venv/lib/python3.12/site-packages/tensorboard/compat/notf.py
-RUN python -X faulthandler -c "from rl2 import train_ppo_gym; from rl2.envs.visfly.navigation import RGBNavigationEnv; import habitat_sim; assert hasattr(habitat_sim.Simulator, 'route_motion_is_valid')"
+RUN python -X faulthandler -c "from rl2 import train_ppo_gym; from rl2.envs.visfly.navigation import RGBNavigationEnv; import habitat_sim; assert hasattr(habitat_sim.Simulator, 'route_motion_is_valid'); assert hasattr(habitat_sim.gfx.Renderer.Flags, 'RGB_DEPTH')"
 
 # Keep the standard image as the default build target.
 FROM training AS default
