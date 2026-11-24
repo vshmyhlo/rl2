@@ -162,6 +162,7 @@ class RGBNavigationEnv(NavigationEnv):
         self.flight_height = flight_height
         self.goal_distance = goal_distance
         self.failure_penalty = failure_penalty
+        self.reward_components: dict[str, torch.Tensor] = {}  # (B,) signed pre-reset reward contributions
         self.power_config = TypeAdapter(PowerConfig).validate_python(power) if power is not None else None
         self._power_meter: CompiledEuler | NativePowerMeter | None = None
         if not visual:
@@ -436,16 +437,16 @@ class RGBNavigationEnv(NavigationEnv):
 
         Consumption includes terminal actions. Success overrides the failure cost;
         timeouts and scene rotations alone incur no failure cost. Zero weights
-        preserve upstream rewards. VisFly records rewards before autoreset.
+        preserve upstream rewards. Snapshot signed components before autoreset.
         """
         reward = super().get_reward(predicted_obs=predicted_obs)  # (B,)
+        self.reward_components = {"navigation": reward, "failure": torch.zeros_like(reward)}  # (B,) leaves
         usage = self.power_usage
         if self.power_config is not None and usage is not None:
-            reward = (
-                reward
-                - self.power_config.energy_weight * usage.energy
-                - self.power_config.excess_power_weight * usage.excess
-            )  # (B,)
+            energy_cost = self.power_config.energy_weight * usage.energy  # (B,)
+            excess_cost = self.power_config.excess_power_weight * usage.excess  # (B,)
+            self.reward_components["power"] = -energy_cost - excess_cost  # (B,)
+            reward = reward - energy_cost - excess_cost  # (B,)
         if self.failure_penalty == 0:
             return reward  # (B,)
         # End flags are updated after get_reward; _episode_done describes the previous step.
@@ -454,7 +455,8 @@ class RGBNavigationEnv(NavigationEnv):
             & ~self._success
             & (self._failure | self.is_out_bounds | (self.is_collision & self.is_collision_reset))
         )  # (B,)
-        return reward - self.failure_penalty * failure  # (B,)
+        self.reward_components["failure"] = -self.failure_penalty * failure  # (B,)
+        return reward + self.reward_components["failure"]  # (B,)
 
     def _randomize_targets(self, indices: torch.Tensor) -> None:  # (N,) agent indices
         manager = self.envs.sceneManager

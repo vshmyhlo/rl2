@@ -36,6 +36,13 @@ def test_thrust_power_preserves_zero_slope_with_autograd() -> None:
     assert compiled.shape == (4, 3)
     np.testing.assert_allclose(jax.device_get(compiled), power.detach().numpy())
 
+    def total_power(ratio: jax.Array) -> jax.Array:  # (4, B) -> ()
+        return thrust_power(ratio).sum()  # ()
+
+    gradient = jax.jit(jax.grad(total_power))(jax.device_put(thrust.detach().numpy()))  # (4, B)
+    assert gradient.shape == (4, 3)
+    np.testing.assert_allclose(jax.device_get(gradient), thrust.grad.numpy())
+
 
 def test_accumulation_clips_each_motor_before_averaging_and_thresholding() -> None:
     power = jnp.array([[4.0, -4.0, 0.0], [-4.0, -4.0, 0.0], [0.0, -4.0, 0.0], [0.0, -4.0, 0.0]])  # (4, B)

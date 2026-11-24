@@ -52,15 +52,21 @@ def build_layers(context: Path) -> list[bytes]:
         return [read_member("blobs/" + layer["digest"].replace(":", "/")) for layer in manifest["layers"]]
 
 
-def test_source_edits_reuse_data_layer(tmp_path: Path) -> None:
+@pytest.mark.parametrize("target", ["training", "visfly"])
+def test_source_edits_reuse_data_layer(target: str, tmp_path: Path) -> None:
     dockerfile = (ROOT / "infra/k3s/training/Dockerfile").read_text().splitlines()
     # Exercise the real context-copy instructions without installing GPU dependencies.
-    copies = [
-        line
-        for line in dockerfile
-        if line.startswith("COPY ") and (line.endswith(" .") or line.startswith("COPY data/"))
-    ]
-    (tmp_path / "Dockerfile").write_text("\n".join([dockerfile[0], "FROM scratch", *copies]) + "\n")
+    copies = []
+    stage = ""
+    for line in dockerfile:
+        if line.startswith("FROM "):
+            stage = line.split()[-1]
+        if stage == target and line.startswith("COPY "):
+            copies.append(line)
+    (tmp_path / "Dockerfile").write_text(
+        "\n".join([dockerfile[0], "FROM scratch", "COPY runtime.txt /runtime.txt", *copies]) + "\n"
+    )
+    (tmp_path / "runtime.txt").write_text("original runtime\n")
     (tmp_path / ".dockerignore").write_text((ROOT / ".dockerignore").read_text())
     included = ["data/alfworld/game.json", "src/rl2/model.py", ".rl2-sweep-test/trial.yaml", "nvida.env"]
     excluded = [
@@ -78,10 +84,10 @@ def test_source_edits_reuse_data_layer(tmp_path: Path) -> None:
         path.write_text("initial\n")
 
     original = build_layers(tmp_path)
-    assert len(original) == 2
+    assert len(original) == 3
     with (
-        tarfile.open(fileobj=io.BytesIO(original[0])) as data,
-        tarfile.open(fileobj=io.BytesIO(original[1])) as source,
+        tarfile.open(fileobj=io.BytesIO(original[1])) as data,
+        tarfile.open(fileobj=io.BytesIO(original[2])) as source,
     ):
         assert "data/alfworld/game.json" in data.getnames()
         assert not any(name.startswith("data/") for name in source.getnames())
@@ -90,9 +96,14 @@ def test_source_edits_reuse_data_layer(tmp_path: Path) -> None:
 
     (tmp_path / "src/rl2/model.py").write_text("changed source\n")
     changed = build_layers(tmp_path)
-    assert changed[0] == original[0]
-    assert changed[1] != original[1]
+    assert changed[:2] == original[:2]
+    assert changed[2] != original[2]
 
     for relative in excluded:
         (tmp_path / relative).write_text("changed ignored file\n")
     assert build_layers(tmp_path) == changed
+
+    (tmp_path / "runtime.txt").write_text("updated runtime\n")
+    rebased = build_layers(tmp_path)
+    assert rebased[0] != changed[0]
+    assert rebased[1] == changed[1]

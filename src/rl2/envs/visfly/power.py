@@ -19,6 +19,7 @@ current/voltage limits are omitted; this meter does not change flight dynamics.
 
 from typing import Annotated, Any, NamedTuple
 
+import jax
 import jax.numpy as jnp
 import torch
 from jax import Array as JaxArray
@@ -54,13 +55,29 @@ def hover_rotor_speed[Array: (JaxArray, torch.Tensor)](
     return (-b + (b * b - 4 * a * (c - hover_thrust)) ** 0.5) / (2 * a)  # ()/(1,)
 
 
+@jax.custom_jvp
+def _jax_thrust_power(thrust_ratio: JaxArray) -> JaxArray:  # (4, B) -> (4, B)
+    return thrust_ratio * jnp.sqrt(thrust_ratio)  # (4, B), avoid a general power operation in XLA
+
+
+@_jax_thrust_power.defjvp
+def _jax_thrust_power_jvp(
+    primals: tuple[JaxArray],  # one (4, B) leaf
+    tangents: tuple[JaxArray],  # one (4, B) leaf
+) -> tuple[JaxArray, JaxArray]:
+    (ratio,) = primals  # (4, B)
+    (tangent,) = tangents  # (4, B)
+    # Differentiating q * sqrt(q) directly gives 0 * inf at q=0; q**1.5 has slope zero.
+    return _jax_thrust_power(ratio), 1.5 * jnp.sqrt(ratio) * tangent  # each (4, B)
+
+
 def thrust_power[Array: (JaxArray, torch.Tensor)](
     thrust_ratio: Array,  # (4, B), nonnegative T/T_hover
 ) -> Array:  # (4, B)
     """Return (4, B) hover-relative ideal power at fixed air density and rotor area."""
     if isinstance(thrust_ratio, torch.Tensor):
         return thrust_ratio.pow(1.5)  # (4, B), preserve the zero slope for native autograd
-    return thrust_ratio * jnp.sqrt(thrust_ratio)  # (4, B), avoid a general power operation in XLA
+    return _jax_thrust_power(thrust_ratio)  # (4, B)
 
 
 def motor_power[Array: (JaxArray, torch.Tensor)](
@@ -104,21 +121,22 @@ class NativePowerMeter:
         self.power_usage: PowerUsage[torch.Tensor] | None = None
         self._step = dynamics.step
         self._run_motors = dynamics._run_motors
-        self.hover_thrust = dynamics.m * 9.81 / 4  # ()/(1,)
+        hover_thrust = dynamics.m * 9.81 / 4  # ()/(1,)
+        self.inverse_hover_thrust = 1 / hover_thrust  # ()/(1,), normalize without substep divisions
         if config.motor is not None:
-            self.hover_omega = hover_rotor_speed(self.hover_thrust, dynamics._thrust_map)  # ()/(1,)
+            self.inverse_hover_omega = 1 / hover_rotor_speed(hover_thrust, dynamics._thrust_map)  # ()/(1,)
         dynamics._run_motors = self.run_motors
 
     def run_motors(self, desired: torch.Tensor) -> torch.Tensor:  # (4, B) -> (4, B)
         motor = self.config.motor
         if motor is not None:
-            previous_speed = self.dynamics._motor_omega / self.hover_omega  # (4, B), snapshot before update
+            previous_speed = self.dynamics._motor_omega * self.inverse_hover_omega  # (4, B), snapshot before update
         thrust = self._run_motors(desired)  # (4, B)
-        thrust_ratio = thrust.clamp_min(0) / self.hover_thrust  # (4, B)
+        thrust_ratio = thrust.clamp_min(0) * self.inverse_hover_thrust  # (4, B)
         if motor is None:
             power = thrust_power(thrust_ratio)  # (4, B)
         else:
-            speed = self.dynamics._motor_omega / self.hover_omega  # (4, B)
+            speed = self.dynamics._motor_omega * self.inverse_hover_omega  # (4, B)
             power = motor_power(previous_speed, speed, thrust_ratio, self.dynamics.dt, motor)  # (4, B)
         usage = self.power_usage
         if usage is not None:

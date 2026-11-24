@@ -4,3 +4,5 @@ disable:
   - servicelb
 write-kubeconfig-mode: "0600"
 secrets-encryption: true
+kubelet-arg:
+  - eviction-pressure-transition-period=1m

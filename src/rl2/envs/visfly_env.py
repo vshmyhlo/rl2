@@ -190,6 +190,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         host_actions = np.array(actions, copy=True)  # (B, *action_shape)
         with self._use_rng():
             observations, rewards, done, infos = self.backend.step(host_actions)
+        reward_components = jax.tree.map(to_numpy, getattr(self.backend, "reward_components", {}))  # (B,) leaves
         power_info = GymStyleInfo()
         if self.config.power is not None:
             usage = jax.tree.map(to_numpy, self.backend.power_usage)  # leaves: (B,)
@@ -270,6 +271,8 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
                 for index, trajectory in enumerate(trajectories)
             ]  # each point: (3,)
         info = GymStyleInfo(stop_reason=stop_reasons, **power_info)  # leaves: (B,)
+        if reward_components:
+            info["reward_components"] = reward_components  # (B,) leaves
         if self.config.route_sampling is not None and self.backend.sampled_routes:
             routes = self.backend.sampled_routes
             info["route_sampling"] = RouteSamplingInfo(

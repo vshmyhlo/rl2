@@ -150,6 +150,20 @@ VisFly evaluation consumption metric (only with complete env.power measurements)
         Logged per evaluation at completed training environment steps, excluding
         video replays; not cumulative. Individual values are saved in the report.
 
+Evaluation reward components:
+    eval/return/<component>: Mean signed, undiscounted episode contribution in raw
+        reward units, summing all transitions including the terminal action, then
+        weighting scored episodes equally. Emitted per evaluation at completed
+        training environment steps; not cumulative and excludes video replays.
+        Labels come from environment reward_components metadata. VisFly emits
+        eval/return/navigation (upstream navigation shaping and success reward),
+        eval/return/failure (negative crash/out-of-bounds/other terminal failure
+        cost; success takes precedence), and eval/return/power (negative energy
+        and excess-power cost, only with env.power measurements). Omit a component
+        unless measured on every transition of every scored episode; preserve
+        measured zeros. Per-episode sums are saved as return_components in the
+        JSON report, omitting components missing any episode transition.
+
 Evaluation and its video replays use deterministic actions: categorical argmax,
 clipped Gaussian means, or Beta means scaled to the action bounds. Training and
 standalone gameplay sample actions. Evaluation uses fixed environment seeds and
@@ -921,6 +935,7 @@ class EpisodeResult(NamedTuple):
     truncated: bool = False
     final_goal_distance: float | None = None
     power_ratio: float | None = None
+    return_components: dict[str, float] | None = None
 
 
 @partial(jax.jit, static_argnames=("apply_fn",))
@@ -994,6 +1009,8 @@ def play_episode(
     final_goal_distance = None
     power_count = 0
     power_ratio_sum = 0.0
+    component_sums: dict[str, float] = {}
+    component_counts: dict[str, int] = {}
     memory = initial_carry  # leaves: (1, H)
     starts = jnp.ones(1, dtype=bool)  # (1,)
     with (
@@ -1019,6 +1036,10 @@ def play_episode(
             observations = jax.device_put(transition.observations)  # leaves: (1, *O)
             episode_return += float(transition.rewards[0])
             length += 1
+            if transition.info is not None:
+                for name, values in transition.info.get("reward_components", {}).items():  # values: (1,)
+                    component_sums[name] = component_sums.get(name, 0.0) + float(values[0])
+                    component_counts[name] = component_counts.get(name, 0) + 1
             if transition.info is not None and "power_ratio" in transition.info:
                 power_count += 1
                 power_ratio_sum += float(transition.info["power_ratio"][0])
@@ -1057,6 +1078,8 @@ def play_episode(
         truncated=truncated,
         final_goal_distance=final_goal_distance,
         power_ratio=power_ratio_sum / length if power_count == length and length else None,
+        return_components={name: total for name, total in component_sums.items() if component_counts[name] == length}
+        or None,
     )
 
 
@@ -1237,6 +1260,7 @@ def log_evaluation(
                     else {}
                 ),
                 **({"power_ratio": episode.power_ratio} if episode.power_ratio is not None else {}),
+                **({"return_components": episode.return_components} if episode.return_components else {}),
             }
             for episode in episodes
         ],
@@ -1257,6 +1281,9 @@ def log_evaluation(
         "eval/termination_fraction": fmean(episode.terminated for episode in episodes),
         "eval/truncation_fraction": fmean(episode.truncated for episode in episodes),
     }
+    components = [episode.return_components or {} for episode in episodes]
+    for name in sorted(set.intersection(*(set(values) for values in components))):
+        scalars[f"eval/return/{name}"] = fmean(values[name] for values in components)
     reasons = [episode.stop_reason for episode in episodes if episode.stop_reason is not None]
     if len(reasons) == len(episodes):
         for code, reason in STOP_REASON_NAMES.items():

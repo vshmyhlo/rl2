@@ -38,6 +38,7 @@ class GymStyleInfo(TypedDict, total=False):
     goal_distance: NDArray[np.float32]  # (B,) Euclidean distance to the goal in metres
     power_ratio: NDArray[np.float32]  # (B,) mean action power relative to hover
     power_penalty: NDArray[np.float32]  # (B,) nonnegative consumption cost subtracted from reward
+    reward_components: dict[str, NDArray[np.float32]]  # (B,) signed contributions to raw reward
     route_sampling: RouteSamplingInfo  # (N,) leaves; omitted when no starts were sampled
 
 

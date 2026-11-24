@@ -560,8 +560,10 @@ layers are cached using `pyproject.toml`, `uv.lock`, and the selected extra.
 The image installs JAXtari's replacement sprite pack during the build, so training
 starts without an interactive sprite installation or runtime download.
 New image layers use zstd level 1 compression and OCI media types to reduce export overhead.
-Local `data/` files (including downloaded ALFWorld games) occupy a separate layer
-before the editable install and source copy, so source edits do not repack datasets.
+Local `data/` files (including downloaded ALFWorld games) and VisFly scenes use
+separate `COPY --link` layers, so source or runtime changes do not repack datasets.
+Both image targets install application metadata and copy source after their runtime
+dependencies; ordinary source/config edits reuse the large dependency and asset layers.
 Keep generated sweep configs (`.rl2-sweep-*`) in the context; submitted jobs use them.
 JAX and PyTorch/vLLM share CUDA 13.0;
 `cuda-toolkit[cccl,nvcc]` pins matching compiler, headers, and runtime packages.
@@ -661,7 +663,8 @@ An empty requested split raises an error. Override `VISFLY_SCENE_PATH` to restri
 the pool; keep both splits available when evaluation is enabled.
 
 The first simulator build is slow; its compiled dependencies are cached separately
-from training source edits. Scene downloads happen during the build, not at startup.
+from training source edits. Scene downloads have an independent build stage, so
+native patches do not trigger downloads. Downloads happen during the build, not at startup.
 
 Defaults are `--prio low --gpus 1 --cpus 10 --memory-gib 32`. High priority moves ahead of
 waiting low-priority Jobs and preempts running low-priority Jobs when quota is

@@ -155,6 +155,9 @@ def test_navigation_failure_penalty_is_opt_in(navigation_class: type[Any]) -> No
     reward = env.get_reward()  # (B,)
     assert reward.shape == (2,)
     torch.testing.assert_close(reward, env.base_reward)
+    assert set(env.reward_components) == {"navigation", "failure"}
+    assert all(value.shape == (2,) for value in env.reward_components.values())
+    torch.testing.assert_close(env.reward_components["failure"], torch.zeros(2))
 
 
 def test_navigation_rejects_euler_before_initializing_backend(navigation_class: type[Any]) -> None:
@@ -259,6 +262,11 @@ def test_navigation_failure_penalty_terminal_events(navigation_class: type[Any])
     reward = env.get_reward()  # (B,)
     assert reward.shape == (8,)
     torch.testing.assert_close(reward, torch.tensor([-20.1, -20.2, -20.3, -20.4, 3.0, -0.5, -0.6, -0.7]))
+    assert all(value.shape == (8,) for value in env.reward_components.values())
+    torch.testing.assert_close(
+        env.reward_components["failure"], torch.tensor([-20.0, -20.0, -20.0, -20.0, 0.0, 0.0, 0.0, 0.0])
+    )
+    torch.testing.assert_close(sum(env.reward_components.values()), reward)
     torch.testing.assert_close(env.base_reward, torch.tensor([-0.1, -0.2, -0.3, -0.4, 3.0, -0.5, -0.6, -0.7]))
 
 
@@ -274,6 +282,8 @@ def test_navigation_nonterminal_collision_has_no_penalty(navigation_class: type[
     reward = env.get_reward()  # (B,)
     assert reward.shape == (1,)
     torch.testing.assert_close(reward, env.base_reward)
+    assert all(value.shape == (1,) for value in env.reward_components.values())
+    torch.testing.assert_close(env.reward_components["failure"], torch.zeros(1))
 
 
 @pytest.mark.parametrize(
@@ -295,13 +305,20 @@ def test_navigation_power_penalty_and_reset(
     reward = env.get_reward()  # (B,)
     assert reward.shape == (2,)
     torch.testing.assert_close(reward, expected)
-    # Reading rewards is side-effect free; partial autoresets retain terminal consumption.
+    torch.testing.assert_close(
+        env.reward_components["power"], -energy_weight * usage.energy - excess_weight * usage.excess
+    )
+    torch.testing.assert_close(sum(env.reward_components.values()), reward)
+    # Partial autoresets retain terminal consumption and reward contributions.
+    components = env.reward_components
     env.reset_agent_by_id(torch.tensor([0]))
+    assert env.reward_components is components
     assert env.power_usage is usage
     torch.testing.assert_close(env.get_reward(), expected)
     env.reset()
     assert env.power_usage is None
     torch.testing.assert_close(env.get_reward(), env.base_reward)
+    assert "power" not in env.reward_components
 
 
 def test_navigation_power_and_terminal_failure_costs_combine(navigation_class: type[Any]) -> None:
@@ -315,7 +332,10 @@ def test_navigation_power_and_terminal_failure_costs_combine(navigation_class: t
     env._failure = torch.ones(2, dtype=torch.bool)  # (B,)
     env.is_out_bounds = env.is_collision = torch.zeros(2, dtype=torch.bool)  # (B,)
     env.is_collision_reset = True
-    torch.testing.assert_close(env.get_reward(), env.base_reward - torch.tensor([20.04, 0.08]))
+    reward = env.get_reward()  # (B,)
+    torch.testing.assert_close(reward, env.base_reward - torch.tensor([20.04, 0.08]))
+    assert set(env.reward_components) == {"navigation", "power", "failure"}
+    torch.testing.assert_close(sum(env.reward_components.values()), reward)
 
 
 @pytest.mark.parametrize("penalty", [-1.0, float("nan"), float("inf")], ids=["negative", "nan", "infinite"])

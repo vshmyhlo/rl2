@@ -142,6 +142,7 @@ def test_gymnasium_autoreset_keeps_timeout_observation(num_envs: int) -> None:
 
 def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
     backend = VisFlyBatch(num_scenes=2)
+    backend.reward_components = {"navigation": torch.arange(1, 5, dtype=torch.float32)}  # (B=4,) leaves
     settings = VisFlyConfig(num_scenes=2, kwargs={"device": "cpu", "visual": True})
     with (
         patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)) as loader,
@@ -155,6 +156,10 @@ def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
         assert result.info["goal_distance"].shape == (4,)
         assert result.info["goal_distance"].dtype == np.float32
         assert "energy_hover_seconds" not in result.info
+        assert result.info["reward_components"]["navigation"].shape == (4,)
+        assert result.info["reward_components"]["navigation"].dtype == np.float32
+        backend.reward_components["navigation"].zero_()
+        np.testing.assert_array_equal(result.info["reward_components"]["navigation"], [1, 2, 3, 4])
         np.testing.assert_allclose(result.info["goal_distance"], np.sqrt(3) * np.array([10, 20, 30, 1]))
         np.testing.assert_array_equal(result.terminated, [True, False, True, False])
         np.testing.assert_array_equal(result.truncated, [False, True, True, False])
@@ -890,7 +895,10 @@ def test_evaluation_configuration_modes(
         assert adapter.validate_json(adapter.dump_json(parsed)) == parsed
 
 
-def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
+@pytest.mark.parametrize("components", ["complete", "partial", "missing"])
+def test_evaluation_scores_without_rendering(
+    config: ppo.Config, components: Literal["complete", "partial", "missing"]
+) -> None:
     config = replace(config, env=VisFlyConfig(power=PowerConfig()), eval_episodes=2, video_max_frames=1)
     backends = []
 
@@ -907,6 +915,12 @@ def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
                 energy=torch.tensor([0.02 * backend.steps]),  # (B,)
                 excess=torch.zeros(1),  # (B,)
             )
+            if components != "missing":
+                backend.reward_components = {
+                    "navigation": torch.tensor([1.5]),
+                    "failure": torch.zeros(1),
+                    **({"power": torch.tensor([-0.5])} if components == "complete" or backend.steps == 1 else {}),
+                }  # (B=1,) leaves
             if backend.steps == 1:
                 done[:] = False
             return observations, rewards, done, infos
@@ -940,6 +954,17 @@ def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
     assert scalars["eval/power_ratio"] == pytest.approx(1.5)
     assert "eval/power_ratio_max" not in scalars
     report = json.loads(writer.log_text.call_args.args[0])
+    if components == "missing":
+        assert not any(key.startswith("eval/return/") for key in scalars)
+        assert all("return_components" not in episode for episode in report["episodes"])
+    else:
+        expected = {"navigation": 3.0, "failure": 0.0, **({"power": -1.0} if components == "complete" else {})}
+        assert {
+            key.removeprefix("eval/return/"): value for key, value in scalars.items() if key.startswith("eval/return/")
+        } == expected
+        assert all(episode["return_components"] == expected for episode in report["episodes"])
+        if components == "complete":
+            assert sum(expected.values()) == scalars["eval/return"]
     assert report["episodes"][0]["power_ratio"] == pytest.approx(1.5)
     assert all("energy_hover_seconds" not in episode for episode in report["episodes"])
     assert all("power_ratio_max" not in episode for episode in report["episodes"])
@@ -973,7 +998,7 @@ def test_evaluation_stop_fractions_exclude_video_replay(
     episodes = [
         ppo.EpisodeResult(
             episode_return=reward,
-            length=1,
+            length=1 if success else 3,
             frames=[],
             stop_reason=(StopReason.SUCCESS if success else StopReason.COLLISION)
             if complete or (availability == "partial" and success)
@@ -984,6 +1009,13 @@ def test_evaluation_stop_fractions_exclude_video_replay(
             if complete or (availability == "partial" and success)
             else None,
             power_ratio=0.0 if complete or (availability == "partial" and success) else None,
+            return_components={
+                "navigation": 2.0 if success else 5.0,
+                "power": -1.0 if success else -3.0,
+                "failure": 0.0 if success else -2.0,
+            }
+            if complete or (availability == "partial" and success)
+            else None,
         )
         for reward, success in [(1.0, True), (0.0, False)]
     ]
@@ -995,6 +1027,7 @@ def test_evaluation_stop_fractions_exclude_video_replay(
         terminated=True,
         final_goal_distance=100.0,  # Replay must not affect scored distances.
         power_ratio=100.0,
+        return_components={"navigation": 100.0, "power": -100.0, "failure": -100.0},
     )
     writer = Mock()
     with patch.object(ppo, "play_episode", side_effect=[*episodes, replay]) as play:
@@ -1017,15 +1050,21 @@ def test_evaluation_stop_fractions_exclude_video_replay(
         assert sum(fractions.values()) == 1
         assert scalars["eval/final_goal_distance_meters"] == (0 if availability == "zero_distance" else 1)
         assert scalars["eval/power_ratio"] == 0
+        assert scalars["eval/return/navigation"] == 3.5
+        assert scalars["eval/return/power"] == -2.0
+        assert scalars["eval/return/failure"] == -1.0
+        assert sum(value for key, value in scalars.items() if key.startswith("eval/return/")) == scalars["eval/return"]
     else:
         assert fractions == {}
         assert "eval/final_goal_distance_meters" not in scalars
         assert "eval/energy_hover_seconds" not in scalars
         assert "eval/energy_hover_seconds/success" not in scalars
         assert "eval/power_ratio" not in scalars
+        assert not any(key.startswith("eval/return/") for key in scalars)
     report = json.loads(writer.log_text.call_args.args[0])
     assert len(report["episodes"]) == 2
     assert ("stop_reason" in report["episodes"][0]) == (availability != "missing")
+    assert ("return_components" in report["episodes"][0]) == (availability != "missing")
     if complete:
         assert [episode["stop_reason"] for episode in report["episodes"]] == ["success", "collision"]
         assert report["episodes"][0]["final_goal_distance_meters"] == 0
