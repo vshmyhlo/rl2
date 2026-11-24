@@ -1,11 +1,10 @@
 """Navigation rewards and dynamics with RGB and optional aligned depth observations."""
 
 import logging
-from collections import Counter
 from collections.abc import Callable
 from contextlib import ExitStack, closing
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from random import Random
@@ -25,6 +24,7 @@ from rl2.envs.visfly.dynamics import CompiledEuler
 from rl2.envs.visfly.errors import NoSamplingVolumeError
 from rl2.envs.visfly.planning import build_roadmap, build_routes, sample_route, segments_clear
 from rl2.envs.visfly.planning_worker import plan_scene
+from rl2.envs.visfly.power import NativePowerMeter, PowerConfig, PowerUsage
 from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.sampling import sample_positions, sampling_bounds
 from rl2.envs.visfly.scenarios import Scenario
@@ -45,36 +45,6 @@ class RouteCatalogue:
     training: bool
     routes: list[Route]
     long_threshold: float
-
-
-@dataclass
-class RouteStatistics:
-    count: int = 0
-    initial_distance: float = 0.0
-    reference_length: float = 0.0
-    blocked: int = 0
-    difficulties: Counter[str] = field(default_factory=Counter)
-
-    def add(self, route: Route) -> None:
-        self.count += 1
-        self.initial_distance += route.initial_distance
-        self.reference_length += route.length
-        self.blocked += route.direct_blocked
-        self.difficulties[route.difficulty] += 1
-
-    def metrics(self) -> dict[str, float]:
-        if self.count == 0:
-            return {}
-        return {
-            "rollout/sampled_episode_count": self.count,
-            "rollout/initial_goal_distance_meters": self.initial_distance / self.count,
-            "rollout/reference_route_length_meters": self.reference_length / self.count,
-            "rollout/direct_path_blocked_fraction": self.blocked / self.count,
-            **{
-                f"rollout/difficulty_fraction/{level}": self.difficulties[level] / self.count
-                for level in ("easy", "medium", "hard")
-            },
-        }
 
 
 @dataclass
@@ -152,6 +122,7 @@ class RGBNavigationEnv(NavigationEnv):
         flight_height: tuple[float, float] = (0.5, 2.5),
         goal_distance: tuple[float, float] = (2.0, 8.0),
         failure_penalty: float = 0.0,
+        power: dict[str, Any] | None = None,
         route_sampling: dict[str, Any] | None = None,
         scenario: dict[str, Any] | None = None,
         scene_path: str | None = None,
@@ -165,10 +136,10 @@ class RGBNavigationEnv(NavigationEnv):
             raise ValueError("RGBNavigationEnv requires ori_output_type='quaternion' for the upstream reward")
         if not 0 <= failure_penalty < float("inf"):
             raise ValueError("failure_penalty must be nonnegative and finite")
-        if spawn_clearance <= 0 or not 0 <= flight_height[0] < flight_height[1]:
-            raise ValueError(
-                "spawn_clearance must be positive and flight_height must be an increasing nonnegative range"
-            )
+        if not 0 < spawn_clearance < float("inf"):
+            raise ValueError("spawn_clearance must be positive and finite")
+        if not 0 <= flight_height[0] < flight_height[1]:
+            raise ValueError("flight_height must be an increasing nonnegative range")
         if not 0.5 < goal_distance[0] < goal_distance[1]:
             raise ValueError("goal_distance must be an increasing range above the 0.5 m success radius")
         self.route_config = (
@@ -185,12 +156,14 @@ class RGBNavigationEnv(NavigationEnv):
         self._route_catalogues: dict[int, RouteCatalogue] = {}
         self._initial_scene_objects: dict[int, tuple[Any, list[Any]]] = {}
         self._wind_settings = kwargs.get("dynamics_kwargs", {}).get("wind_settings", [0, 0, 0])
-        self.route_statistics = RouteStatistics()
+        self.sampled_routes: list[Route] = []
         self.scene_randomization = scene_randomization
         self.spawn_clearance = spawn_clearance
         self.flight_height = flight_height
         self.goal_distance = goal_distance
         self.failure_penalty = failure_penalty
+        self.power_config = TypeAdapter(PowerConfig).validate_python(power) if power is not None else None
+        self._power_meter: CompiledEuler | NativePowerMeter | None = None
         if not visual:
             raise ValueError("RGBNavigationEnv requires visual=True")
         if sensor_kwargs is None:
@@ -230,7 +203,13 @@ class RGBNavigationEnv(NavigationEnv):
                 and self.envs.dynamics._integrator == "euler"
                 and torch.device(self.device).type == "cpu"
             ):
-                self.envs.dynamics.step = CompiledEuler(self.envs.dynamics).step
+                integrator = CompiledEuler(self.envs.dynamics, power=self.power_config)
+                self.envs.dynamics.step = integrator.step
+                if self.power_config is not None:
+                    self._power_meter = integrator
+            elif self.power_config is not None:
+                self._power_meter = NativePowerMeter(self.envs.dynamics, self.power_config)
+                self.envs.dynamics.step = self._power_meter.step
             if spawn_clearance < self.envs.uav_radius:
                 raise ValueError(
                     f"spawn_clearance must be at least the drone collision radius ({self.envs.uav_radius} m)"
@@ -437,24 +416,32 @@ class RGBNavigationEnv(NavigationEnv):
             bounds.upper,
             long_threshold=self._route_catalogues[scene_id].long_threshold,
         )
-        self.route_statistics.add(route)
+        self.sampled_routes.append(route)
         return route
 
-    def sampling_metrics(self) -> dict[str, float]:
-        metrics = self.route_statistics.metrics()
-        self.route_statistics = RouteStatistics()
-        return metrics
+    @property
+    def power_usage(self) -> PowerUsage[torch.Tensor] | None:
+        """Return (B,) consumption leaves for the last action, including terminal substeps."""
+        return self._power_meter.power_usage if self._power_meter is not None else None
 
     def get_reward(
         self,
         predicted_obs: dict[str, torch.Tensor] | None = None,  # leaves: (B, *O)
     ) -> torch.Tensor:  # (B,)
-        """Return (B,) navigation rewards with an optional one-time terminal failure cost.
+        """Return (B,) navigation rewards minus optional consumption and terminal failure costs.
 
-        Zero preserves upstream rewards. Success overrides failure; timeouts and
-        scene rotations alone incur no penalty. VisFly records rewards before autoreset.
+        Consumption includes terminal actions. Success overrides the failure cost;
+        timeouts and scene rotations alone incur no failure cost. Zero weights
+        preserve upstream rewards. VisFly records rewards before autoreset.
         """
         reward = super().get_reward(predicted_obs=predicted_obs)  # (B,)
+        usage = self.power_usage
+        if self.power_config is not None and usage is not None:
+            reward = (
+                reward
+                - self.power_config.energy_weight * usage.energy
+                - self.power_config.excess_power_weight * usage.excess
+            )  # (B,)
         if self.failure_penalty == 0:
             return reward  # (B,)
         # End flags are updated after get_reward; _episode_done describes the previous step.
@@ -467,15 +454,14 @@ class RGBNavigationEnv(NavigationEnv):
 
     def _randomize_targets(self, indices: torch.Tensor) -> None:  # (N,) agent indices
         manager = self.envs.sceneManager
+        # Preserve targets referenced by terminal observations before autoreset.
+        targets = self.target.clone()  # (B, 3)
         if self.scenario is not None or self.route_config is not None:
-            targets = self.target.clone()  # (B, 3)
             for index in indices.tolist():
                 route = self.envs.stateGenerators[index].route
                 targets[index] = targets.new_tensor(route.points[-1])  # (3,)
             self.target = targets  # (B, 3)
             return
-        # Preserve targets referenced by terminal observations before autoreset.
-        targets = self.target.clone()  # (B, 3)
         scene_ids = indices // self.num_agent_per_scene  # (N,)
         for scene_id in scene_ids.unique().tolist():
             agents = indices[scene_ids == scene_id]  # (M,)
@@ -499,6 +485,8 @@ class RGBNavigationEnv(NavigationEnv):
             if manager.scenes[index] is scene:
                 for drone, transform in zip(manager._drones[index], transforms, strict=True):
                     drone.root_scene_node.transformation = transform
+        if self._power_meter is not None:
+            self._power_meter.power_usage = None
         observations = super().reset(state=state, **kwargs)  # leaves: (B, *O)
         if manager.render_settings is not None or manager.is_multi_drone:
             for index, scene in enumerate(manager.scenes):

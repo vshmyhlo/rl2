@@ -10,6 +10,8 @@ import torch
 from jax.sharding import Mesh
 from numpy.typing import NDArray
 
+from rl2.envs.visfly.power import PowerConfig, PowerUsage
+
 
 class FlightState[Array](NamedTuple):
     position: Array  # (3, B)
@@ -35,6 +37,7 @@ class PhysicsResult[Array](NamedTuple):
     thrust: Array  # (4, B)
     acceleration: Array  # (3, B)
     angular_acceleration: Array  # (3, B)
+    power_usage: PowerUsage[Array] | None = None  # leaves: (B,), absent when disabled
 
 
 def quaternion_product(left: jax.Array, right: jax.Array) -> jax.Array:  # (4, B), (4, B) -> (4, B)
@@ -66,13 +69,15 @@ def integrate_euler(
     *,
     steps: int,
     delay: bool,
+    power_threshold: float | None = None,
 ) -> PhysicsResult[jax.Array]:
     """Advance the unchanged motor/Euler equations through all control-interval substeps.
 
     state: (3, B)/(4, B) state leaves in VisFly's component-major layout.
     desired_thrust: (4, B) clamped controller output held over the interval.
     wind: (3, 1) or (3, B) additive position velocity, matching upstream.
-    Returns: (3, B)/(4, B) state and final-substep thrust/accelerations.
+    Returns: (3, B)/(4, B) state and final-substep thrust/accelerations, optional
+        (B,) integrated energy/excess over the control interval.
     """
     a, b, c = parameters.thrust_map  # each ()
     desired_omega = (-b + jnp.sqrt(b * b - 4 * a * (c - desired_thrust))) / (2 * a)  # (4, B)
@@ -84,6 +89,14 @@ def integrate_euler(
             thrust = a * omega**2 + b * omega + c  # (4, B)
         else:
             thrust = desired_thrust  # (4, B)
+        usage = result.power_usage
+        if power_threshold is not None and usage is not None:
+            ratio = jnp.maximum(thrust, 0) / (parameters.mass * 9.81 / 4)  # (4, B)
+            power = jnp.mean(ratio * jnp.sqrt(ratio), axis=0)  # (B,)
+            usage = PowerUsage(
+                energy=usage.energy + power * dt,  # (B,)
+                excess=usage.excess + jnp.maximum(power - power_threshold, 0) ** 2 * dt,  # (B,)
+            )
         force_torque = parameters.allocation @ thrust  # (4, B)
         conjugate = orientation * jnp.array([1, -1, -1, -1], dtype=orientation.dtype)[:, None]  # (4, B)
         body_velocity = rotate(conjugate, velocity)  # (3, B)
@@ -111,6 +124,7 @@ def integrate_euler(
             thrust=thrust,
             acceleration=acceleration,
             angular_acceleration=angular_acceleration,
+            power_usage=usage,
         )
 
     initial = PhysicsResult(
@@ -118,6 +132,14 @@ def integrate_euler(
         thrust=desired_thrust,
         acceleration=jnp.zeros_like(state.velocity),
         angular_acceleration=jnp.zeros_like(state.angular_velocity),
+        power_usage=(
+            PowerUsage(
+                energy=jnp.zeros_like(state.position[0]),  # (B,)
+                excess=jnp.zeros_like(state.position[0]),  # (B,)
+            )
+            if power_threshold is not None
+            else None
+        ),
     )
     return jax.lax.fori_loop(0, steps, substep, initial)
 
@@ -134,8 +156,10 @@ def writable_tensor(value: NDArray[np.float32]) -> torch.Tensor:  # (*S,) -> (*S
 class CompiledEuler:
     """Bridge CPU Torch state to one fused control-interval executable."""
 
-    def __init__(self, dynamics: Any) -> None:
+    def __init__(self, dynamics: Any, power: PowerConfig | None = None) -> None:
         self.dynamics = dynamics
+        self.power = power
+        self.power_usage: PowerUsage[torch.Tensor] | None = None
         self.device = jax.devices("cpu")[0]
         self.mesh = Mesh(devices=[self.device], axis_names=("physics",))
         self.parameters = jax.device_put(
@@ -196,10 +220,12 @@ class CompiledEuler:
                         dynamics.dt,
                         steps=dynamics._interval_steps,
                         delay=dynamics._ctrl_delay,
+                        power_threshold=self.power.power_threshold if self.power is not None else None,
                     )
                 ),
             )
         dynamics._position = result.state.position  # (3, B)
+        self.power_usage = result.power_usage  # leaves: (B,), retained through autoresets
         w, x, y, z = result.state.orientation  # each (B,)
         dynamics._orientation = type(dynamics._orientation)(w=w, x=x, y=y, z=z)
         dynamics._velocity = result.state.velocity  # (3, B)

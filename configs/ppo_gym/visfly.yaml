@@ -4,7 +4,7 @@ env:
   num_scenes: 8 # 4 agents per scene
   scene_rotation_env_steps: 128000 # Reload after 4000 steps per agent (80 seconds); truncate ongoing episodes
   power: # Uncalibrated effort shaping; null disables, zero weights retain diagnostics only.
-    energy_weight: 0.05 # Reward cost per hover-equivalent second; hover costs 0.001 per 50 Hz action.
+    energy_weight: 0.1 # Reward cost per hover-equivalent second; hover costs 0.001 per 50 Hz action.
     excess_power_weight: 0.1 # Cost per second times squared excess power ratio.
     power_threshold: 1.5 # Excess penalty starts above 1.5 times hover power.
   route_sampling:
@@ -22,7 +22,7 @@ env:
     planning_prefetch: true # Prepare the next rotation while the current scenes train
     shared_rgbd: true # One draw for aligned RGB/depth; separate passes for incompatible sensors or video
     max_episode_steps: 1500 # 30 seconds at 50 Hz; evaluation uses each saved route budget
-    failure_penalty: 0.0 # Subtract once on terminal failure; 0 disables. Success and truncation alone are exempt.
+    failure_penalty: 1.0 # Subtract once on terminal failure; 0 disables. Success and truncation alone are exempt.
     scene_randomization: true
     spawn_clearance: 0.3 # Metres from geometry
     flight_height: [0.5, 2.5] # Metres above each scene's bounding-box floor
@@ -91,9 +91,9 @@ target_kl: 0.02
 entropy_coef: 0.001
 max_grad_norm: 0.5
 video_fps: 50.0
-video_interval: 0 # Record videos only during evaluation
+video_interval: 200 # Record videos only during evaluation
 eval_interval: 500
 eval_episodes: null # Required with env.evaluation; use a positive count only when env.evaluation is null
 eval_video: true
-run_id: ppo_gym_visfly_rgbd_power_ne${num_envs}_ns${num_steps}_mb${num_minibatches}_ue${update_epochs}_fp${env.kwargs.failure_penalty}_seed${seed}
+run_id: ppo_gym_visfly_rgbd_ne${num_envs}_ns${num_steps}_mb${num_minibatches}_ue${update_epochs}_fp${env.kwargs.failure_penalty}_ew${env.power.energy_weight}_seed${seed}
 ckpt_dir: /runs/ppo_gym/${run_id}

@@ -23,9 +23,11 @@ from rl2.envs.gym_style_env import (
     GymStyleEnv,
     GymStyleInfo,
     GymStyleStep,
+    RouteSamplingInfo,
     StopReason,
     replace_observation,
 )
+from rl2.envs.visfly.power import PowerConfig
 from rl2.envs.visfly.render import RenderContext, depth_panel, diagnostics_panel, fit_panel, top_down_panel
 from rl2.envs.visfly.routes import RouteConfig
 from rl2.envs.visfly.scenarios import EvaluationConfig, Manifest, Scenario
@@ -95,6 +97,7 @@ class VisFlyConfig:
     channels_first: bool = True  # Backend images are CHW; False accepts already-HWC images.
     route_sampling: RouteConfig | None = None
     evaluation: EvaluationConfig | None = None
+    power: PowerConfig | None = None
 
 
 class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
@@ -132,6 +135,10 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         if reserved:
             raise ValueError(f"VisFly kwargs are managed by the trainer: {sorted(reserved)}")
         kwargs = deepcopy(config.kwargs)
+        if "power" in kwargs:
+            raise ValueError("Configure consumption through env.power, not env.kwargs.power")
+        if config.power is not None:
+            kwargs["power"] = asdict(config.power)
         if config.route_sampling is not None:
             kwargs["route_sampling"] = asdict(config.route_sampling)
         if config.scene_rotation_env_steps is not None:
@@ -183,6 +190,17 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         host_actions = np.array(actions, copy=True)  # (B, *action_shape)
         with self._use_rng():
             observations, rewards, done, infos = self.backend.step(host_actions)
+        power_info = GymStyleInfo()
+        if self.config.power is not None:
+            usage = jax.tree.map(to_numpy, self.backend.power_usage)  # leaves: (B,)
+            duration = self.backend.envs.dynamics.dt * self.backend.envs.dynamics._interval_steps
+            penalty = (
+                self.config.power.energy_weight * usage.energy + self.config.power.excess_power_weight * usage.excess
+            )  # (B,)
+            power_info = GymStyleInfo(
+                power_ratio=usage.energy / duration,  # (B,)
+                power_penalty=penalty,  # (B,)
+            )
         rewards = to_numpy(rewards).astype(np.float32, copy=False)  # (B,)
         done = to_numpy(done).astype(bool)  # (B,)
         truncated = np.array(
@@ -251,7 +269,16 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
                 [observations["state"][index, :3].copy()] if terminated[index] or truncated[index] else trajectory
                 for index, trajectory in enumerate(trajectories)
             ]  # each point: (3,)
-        info = GymStyleInfo(stop_reason=stop_reasons)  # leaves: (B,)
+        info = GymStyleInfo(stop_reason=stop_reasons, **power_info)  # leaves: (B,)
+        if self.config.route_sampling is not None and self.backend.sampled_routes:
+            routes = self.backend.sampled_routes
+            info["route_sampling"] = RouteSamplingInfo(
+                initial_goal_distance_meters=np.array([route.initial_distance for route in routes]),  # (N,)
+                reference_route_length_meters=np.array([route.length for route in routes]),  # (N,)
+                direct_path_blocked=np.array([route.direct_blocked for route in routes]),  # (N,)
+                difficulty=np.array([route.difficulty for route in routes]),  # (N,)
+            )
+            self.backend.sampled_routes = []
         if has_final_observations:
             info["goal_distance"] = np.linalg.norm(final["target"] - final["state"][:, :3], axis=-1).astype(
                 np.float32
