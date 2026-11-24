@@ -83,7 +83,7 @@ class NavigationStub:
             else ["scene_c", "scene_a", "scene_b"]
         )
         self.envs = SimpleNamespace(
-            dynamics=Mock(),
+            dynamics=Mock(m=torch.tensor(1.0)),  # m: ()
             uav_radius=0.1,
             sceneManager=SimpleNamespace(
                 scenes=[None, None],

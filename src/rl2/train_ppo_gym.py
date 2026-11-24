@@ -84,7 +84,10 @@ VisFly consumption window metrics (only with env.power):
         each action averages its physics substeps. Dimensionless.
     rollout/power_penalty: Mean nonnegative consumption reward cost per transition.
         Both means include terminal transitions and scene rotations.
-        Power is mean((max(rotor_thrust, 0) / (mass * 9.81 / 4)) ** 1.5) over rotors.
+        Without env.power.motor, power is mean((max(rotor_thrust, 0) / (mass * 9.81 / 4)) ** 1.5).
+        With motor settings, power includes aerodynamic work, rotor kinetic-energy
+        changes and winding heat, clipped per motor to exclude regeneration and
+        normalized by steady-hover power (see envs/visfly/power.py).
         Costs integrate power and squared above-threshold power over physics substeps.
         These are uncalibrated effort estimates, not watts or joules. Zero weights
         retain measurements. Log at log_interval and final windows at completed
@@ -142,6 +145,7 @@ Latest settings and session timings:
 
 VisFly evaluation consumption metric (only with complete env.power measurements):
     eval/power_ratio: Mean of episode mean power ratios (equal episode weighting).
+        Uses the same configured propulsion model as rollout/power_ratio.
         Includes terminal actions and all scored episode outcomes.
         Logged per evaluation at completed training environment steps, excluding
         video replays; not cumulative. Individual values are saved in the report.

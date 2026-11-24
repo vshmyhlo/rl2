@@ -18,7 +18,7 @@ from rl2.envs.visfly.catalogues import build_catalogue, planning_seed
 from rl2.envs.visfly.collision import SceneCollision, collision_points
 from rl2.envs.visfly.generate_manifest import generate_manifest
 from rl2.envs.visfly.planning import build_roadmap, build_routes, sample_route, segments_clear
-from rl2.envs.visfly.power import PowerConfig
+from rl2.envs.visfly.power import MotorPowerConfig, PowerConfig
 from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.sampling import sampling_bounds
 from rl2.envs.visfly.scenarios import EvaluationConfig
@@ -400,7 +400,7 @@ def test_compiled_physics_matches_upstream_through_autoresets(num_envs: int, del
     for compiled in (False, True):
         config = VisFlyConfig(
             kwargs={**kwargs, "compiled_dynamics": compiled},
-            power=PowerConfig(energy_weight=0.05, excess_power_weight=0.1),
+            power=PowerConfig(energy_weight=0.05, excess_power_weight=0.1, motor=MotorPowerConfig() if delay else None),
         )
         with (
             jax.set_mesh(Mesh(devices=np.array(jax.devices()), axis_names=("trainer",))),

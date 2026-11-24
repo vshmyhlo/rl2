@@ -26,7 +26,7 @@ from rl2.envs import GymStyleEnv, GymStyleStep
 from rl2.envs.gym_env import GymConfig, GymEnv
 from rl2.envs.gym_style_env import GymStyleInfo, RouteSamplingInfo, StopReason
 from rl2.envs.visfly import generate_manifest as manifest_generation
-from rl2.envs.visfly.power import PowerConfig, PowerUsage
+from rl2.envs.visfly.power import MotorPowerConfig, PowerConfig, PowerUsage
 from rl2.envs.visfly.render import RenderContext, diagnostics_panel, top_down_panel
 from rl2.envs.visfly.routes import CATEGORIES, Route, RouteConfig
 from rl2.envs.visfly.scenarios import EvaluationConfig, Manifest, Scenario, SceneCoverage
@@ -819,7 +819,12 @@ def test_visfly_render_channels_last_rectangular_camera_and_final_views() -> Non
 
 def test_configuration_round_trip(config: ppo.Config) -> None:
     values = asdict(config)
-    values["env"] = {"id": "VisFly", "num_scenes": 2, "kwargs": {"visual": True}, "power": {"energy_weight": 0.1}}
+    values["env"] = {
+        "id": "VisFly",
+        "num_scenes": 2,
+        "kwargs": {"visual": True},
+        "power": {"energy_weight": 0.1, "motor": {"inertia_seconds": 0.02, "copper_loss_ratio": 0.2}},
+    }
     values["model"]["encoder"] = asdict(
         ppo.VisFlyEncoderConfig(
             stages=(ConvStage(channels=2, blocks=0),), embedding_size=4, goal_scale=2.0, depth_scale=4.0
@@ -828,7 +833,9 @@ def test_configuration_round_trip(config: ppo.Config) -> None:
     parsed = TypeAdapter(ppo.Config).validate_json(json.dumps(values))
     assert isinstance(parsed.env, VisFlyConfig)
     assert parsed.env.kwargs == {"visual": True}
-    assert parsed.env.power == PowerConfig(energy_weight=0.1)
+    assert parsed.env.power == PowerConfig(
+        energy_weight=0.1, motor=MotorPowerConfig(inertia_seconds=0.02, copper_loss_ratio=0.2)
+    )
     assert isinstance(parsed.model.encoder, ppo.VisFlyEncoderConfig)
     assert parsed.model.encoder.goal_scale == 2.0
     assert parsed.model.encoder.depth_scale == 4.0

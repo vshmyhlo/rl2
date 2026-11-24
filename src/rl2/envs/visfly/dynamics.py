@@ -10,7 +10,15 @@ import torch
 from jax.sharding import Mesh
 from numpy.typing import NDArray
 
-from rl2.envs.visfly.power import PowerConfig, PowerUsage
+from rl2.envs.visfly.power import (
+    MotorPowerConfig,
+    PowerConfig,
+    PowerUsage,
+    accumulate_power,
+    hover_rotor_speed,
+    motor_power,
+    thrust_power,
+)
 
 
 class FlightState[Array](NamedTuple):
@@ -66,7 +74,7 @@ def rotate(orientation: jax.Array, vector: jax.Array) -> jax.Array:  # (4, B), (
     )  # (3, B)
 
 
-@partial(jax.jit, static_argnames=("steps", "delay"))
+@partial(jax.jit, static_argnames=("steps", "delay", "power_motor"))
 def integrate_euler(
     state: FlightState[jax.Array],  # leaves: (3, B) or (4, B)
     parameters: PhysicsParameters[jax.Array],
@@ -77,6 +85,7 @@ def integrate_euler(
     steps: int,
     delay: bool,
     power_threshold: float | None = None,
+    power_motor: MotorPowerConfig | None = None,
 ) -> PhysicsResult[jax.Array]:
     """Advance the unchanged motor/Euler equations through all control-interval substeps.
 
@@ -84,8 +93,17 @@ def integrate_euler(
     desired_thrust: (4, B) clamped controller output held over the interval.
     wind: (3, 1) or (3, B) additive position velocity, matching upstream.
     Returns: (3, B)/(4, B) state and final-substep thrust/accelerations, optional
-        (B,) integrated energy/excess over the control interval.
+        (B,) integrated energy/excess over the control interval. Motor power requires
+        finite motor lag; rotor history comes from state, including after resets.
     """
+    if power_motor is not None and not delay:
+        raise ValueError("Motor power requires ctrl_delay=True to model finite rotor acceleration")
+    if power_threshold is not None:
+        hover_thrust = parameters.mass * 9.81 / 4  # ()/(1,)
+        inverse_hover_thrust = 1 / hover_thrust  # ()/(1,), keep scalar division outside the substeps
+        if power_motor is not None:
+            hover_omega = hover_rotor_speed(hover_thrust, parameters.thrust_map)  # ()/(1,)
+            inverse_hover_omega = 1 / hover_omega  # ()/(1,), hoist normalization out of the substep loop
     if delay:
         a, b, c = parameters.thrust_map  # each ()
         desired_omega = (-b + jnp.sqrt(b * b - 4 * a * (c - desired_thrust))) / (2 * a)  # (4, B)
@@ -99,12 +117,18 @@ def integrate_euler(
             thrust = desired_thrust  # (4, B)
         usage = result.power_usage
         if power_threshold is not None and usage is not None:
-            ratio = jnp.maximum(thrust, 0) / (parameters.mass * 9.81 / 4)  # (4, B)
-            power = jnp.mean(ratio * jnp.sqrt(ratio), axis=0)  # (B,)
-            usage = PowerUsage(
-                energy=usage.energy + power * dt,  # (B,)
-                excess=usage.excess + jnp.maximum(power - power_threshold, 0) ** 2 * dt,  # (B,)
-            )
+            ratio = jnp.maximum(thrust, 0) * inverse_hover_thrust  # (4, B)
+            if power_motor is None:
+                power = thrust_power(ratio)  # (4, B)
+            else:
+                power = motor_power(
+                    result.state.motor_omega * inverse_hover_omega,
+                    omega * inverse_hover_omega,
+                    ratio,
+                    dt,
+                    power_motor,
+                )  # (4, B)
+            usage = accumulate_power(usage, power, dt, power_threshold)
         force_torque = parameters.allocation @ thrust  # (4, B)
         conjugate = orientation * jnp.array([1, -1, -1, -1], dtype=orientation.dtype)[:, None]  # (4, B)
         body_velocity = rotate(conjugate, velocity)  # (3, B)
@@ -168,6 +192,8 @@ class CompiledEuler:
     """Bridge CPU Torch state to one fused control-interval executable."""
 
     def __init__(self, dynamics: Any, power: PowerConfig | None = None) -> None:
+        if power is not None and power.motor is not None and not dynamics._ctrl_delay:
+            raise ValueError("Motor power requires ctrl_delay=True to model finite rotor acceleration")
         self.dynamics = dynamics
         self.power = power
         self.power_usage: PowerUsage[torch.Tensor] | None = None
@@ -232,6 +258,7 @@ class CompiledEuler:
                         steps=dynamics._interval_steps,
                         delay=dynamics._ctrl_delay,
                         power_threshold=self.power.power_threshold if self.power is not None else None,
+                        power_motor=self.power.motor if self.power is not None else None,
                     )
                 ),
             )
