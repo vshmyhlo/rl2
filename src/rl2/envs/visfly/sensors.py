@@ -11,7 +11,7 @@ SensorImages = dict[str, NDArray[Any]]  # values: (H, W, C) color or (H, W) dept
 
 def compatible_sensors(scene: Any, suite: dict[str, Any]) -> bool:
     """Restrict sharing to aligned CPU cameras without noise or postprocessing."""
-    if tuple(suite) != ("color", "depth") or scene.config.enable_batch_renderer or scene.config.sim_cfg.enable_hbao:
+    if suite.keys() != {"color", "depth"} or scene.config.enable_batch_renderer or scene.config.sim_cfg.enable_hbao:
         return False
     color, depth = suite["color"], suite["depth"]
     a, b = color._spec, depth._spec

@@ -305,9 +305,12 @@ def sample_route(
 ) -> Route:
     """Renormalize weights over available levels; jitter endpoints through validated connectors."""
     groups = [[route for route in routes if route.difficulty == level] for level in DIFFICULTIES]
-    weights = torch.tensor([weight if group else 0 for weight, group in zip(config.weights, groups)])  # (3,)
-    if not bool(weights.sum() > 0):
+    available_weights = [weight if group else 0.0 for weight, group in zip(config.weights, groups)]
+    scale = max(available_weights)
+    if scale == 0:
         raise ValueError("No routes for any positively weighted difficulty in this scene")
+    # Scale before float32 conversion so valid weights cannot all underflow or overflow.
+    weights = torch.tensor([weight / scale for weight in available_weights])  # (3,)
     group = groups[int(torch.multinomial(weights, 1))]
     route = group[int(torch.randint(len(group), ()))]
     if bool(torch.randint(2, ())):

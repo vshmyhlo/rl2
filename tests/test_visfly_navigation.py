@@ -166,6 +166,23 @@ def test_navigation_rejects_euler_before_initializing_backend(navigation_class: 
     initialize.assert_not_called()
 
 
+def test_navigation_preserves_native_differentiable_dynamics(navigation_class: type[Any]) -> None:
+    original = NavigationStub.__init__
+
+    def initialize(self: NavigationStub, **kwargs: Any) -> None:
+        original(self, **kwargs)
+        self.envs.dynamics._integrator = "euler"
+
+    compiled = Mock(side_effect=AssertionError("compiled physics detaches gradients"))
+    with (
+        patch.object(NavigationStub, "__init__", initialize),
+        patch.dict(navigation_class.__init__.__globals__, CompiledEuler=compiled),
+        closing(navigation_class(requires_grad=True)) as env,
+    ):
+        assert env.kwargs["requires_grad"] is True
+    compiled.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("split", "randomization", "shuffle"),
     [("train", True, True), ("test", False, False), ("test", True, True)],
@@ -683,8 +700,15 @@ def test_fixed_scenario_pins_scene_state_and_partial_reset_targets(navigation_cl
         seed=3,
     )
     env = navigation_class(
-        scene_randomization=True, scene_split="test", scenario=asdict(scenario), scene_kwargs={"path": str(root)}
+        scene_randomization=True,
+        scene_split="test",
+        scenario=asdict(scenario),
+        scene_kwargs={"path": str(root)},
+        seed=99,
+        max_episode_steps=10,
     )
+    assert env.kwargs["seed"] == scenario.seed
+    assert env.kwargs["max_episode_steps"] == scenario.max_episode_steps
     env.envs.sceneManager.scenes = [empty_geometry(), empty_geometry()]
     assert env.envs.sceneManager._scene_loader.paths == [str(root / scenario.scene)]
     for generator in env.envs.stateGenerators:

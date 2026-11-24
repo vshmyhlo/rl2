@@ -119,7 +119,7 @@ def test_incompatible_sensors_preserve_original_call(field: str, value: Any) -> 
     assert all(not loaded.renderer.bind_render_target.called for loaded in backend.scenes)
 
 
-@pytest.mark.parametrize("reason", ["legacy", "hbao", "batch", "rgb_only", "local_transform", "reversed_sensors"])
+@pytest.mark.parametrize("reason", ["legacy", "hbao", "batch", "rgb_only", "local_transform"])
 def test_unsupported_renderer_or_rig_falls_back(reason: str) -> None:
     backend = manager()
     original = backend.get_observation
@@ -133,12 +133,24 @@ def test_unsupported_renderer_or_rig_falls_back(reason: str) -> None:
         loaded.renderer = None
     elif reason == "rgb_only":
         del loaded._Simulator__sensors[0]["depth"]
-    elif reason == "local_transform":
-        loaded._Simulator__sensors[0]["depth"]._sensor_object.node.transformation = "different"
     else:
-        loaded._Simulator__sensors[0] = dict(reversed(loaded._Simulator__sensors[0].items()))
+        loaded._Simulator__sensors[0]["depth"]._sensor_object.node.transformation = "different"
     SharedRgbdRenderer(backend)
     assert backend.get_observation() is original.return_value
+
+
+def test_aligned_sensors_share_rendering_regardless_of_order() -> None:
+    backend = manager()
+    original = backend.get_observation
+    loaded = backend.scenes[0]
+    loaded._Simulator__sensors[0] = dict(reversed(loaded._Simulator__sensors[0].items()))
+    SharedRgbdRenderer(backend)
+    images = backend.get_observation()
+    original.assert_not_called()
+    assert len(images) == 4
+    np.testing.assert_array_equal(images[0]["color"], 0)
+    np.testing.assert_array_equal(images[0]["depth"], np.arange(6).reshape(2, 3)[::-1])
+    loaded._Simulator__sensors[0]["depth"].draw_observation.assert_not_called()
 
 
 def test_reload_rebinds_only_live_scenes_and_video_restores_fallback() -> None:

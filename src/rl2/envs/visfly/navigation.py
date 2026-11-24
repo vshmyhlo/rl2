@@ -85,11 +85,11 @@ class SceneStateRandomizer:
                 .expand(num, 3)
                 .clone(),  # (N, 3)
             )
-        bounds = sampling_bounds(self.manager._scene_bounds[self.scene_id], self.clearance, self.height)
         if self.route_sampler is not None:
             self.route = self.route_sampler(self.scene_id)
             position = torch.tensor(self.route.points[0]).expand(num, 3).clone()  # (N, 3)
         else:
+            bounds = sampling_bounds(self.manager._scene_bounds[self.scene_id], self.clearance, self.height)
             position = sample_positions(
                 lower=bounds.lower,
                 upper=bounds.upper,
@@ -195,11 +195,15 @@ class RGBNavigationEnv(NavigationEnv):
                     raise ValueError(f"RGBNavigationEnv requires matching RGB/depth {key}")
         # Flight collision/route queries use mesh geometry, not Habitat's walking navmesh.
         kwargs["scene_kwargs"] = {"build_navmesh": False, **kwargs.get("scene_kwargs", {})}
+        if self.scenario is not None:
+            kwargs["seed"] = self.scenario.seed
+            kwargs["max_episode_steps"] = self.scenario.max_episode_steps
         super().__init__(visual=True, sensor_kwargs=sensor_kwargs, **kwargs)
         with ExitStack() as resources:
             resources.enter_context(closing(self))
             if (
                 compiled_dynamics
+                and not kwargs.get("requires_grad", False)
                 and self.envs.dynamics._integrator == "euler"
                 and torch.device(self.device).type == "cpu"
             ):

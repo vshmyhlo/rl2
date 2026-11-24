@@ -10,6 +10,21 @@ from rl2.envs.visfly.dynamics import FlightState, PhysicsParameters, integrate_e
 from rl2.envs.visfly.power import NativePowerMeter, PowerConfig
 
 
+def test_rotation_matches_quaternion_matrix_and_broadcasts() -> None:
+    # A nonunit quaternion also checks the q v q* scaling used by upstream.
+    orientation = jnp.array([[2.0], [1.0], [-2.0], [3.0]])  # (4, 1)
+    vectors = jnp.eye(3)  # (3, B)
+    expected = np.array([[-8.0, -16.0, -2.0], [8.0, -2.0, -16.0], [14.0, -8.0, 8.0]])  # (3, B)
+    rotated = jax.device_get(jax.jit(rotate)(orientation, vectors))  # (3, B)
+    assert rotated.shape == (3, 3)
+    np.testing.assert_allclose(rotated, expected)
+    # Each column is an independent rotation, including the zero quaternion.
+    orientations = orientation * jnp.array([0.0, 0.5, 1.0])  # (4, B)
+    rotated = jax.device_get(jax.jit(rotate)(orientations, vectors[:, :1]))  # (3, B)
+    assert rotated.shape == (3, 3)
+    np.testing.assert_allclose(rotated, expected[:, :1] * np.array([0.0, 0.25, 1.0]))
+
+
 def parameters() -> PhysicsParameters[jax.Array]:
     return PhysicsParameters(
         allocation=jnp.eye(4),  # (4, 4)
@@ -80,6 +95,22 @@ def test_euler_motor_delay_and_body_rotation() -> None:
     orientation = jnp.array([[2**-0.5], [0], [2**-0.5], [0]])  # (4, 1), 90 degrees around Y
     rotated = jax.device_get(rotate(orientation, jnp.array([[0.0], [0.0], [1.0]])))  # (3, 1)
     np.testing.assert_allclose(rotated, [[1], [0], [0]], atol=1e-7)
+
+
+def test_euler_gyroscopic_torque_with_coupled_inertia() -> None:
+    angular_velocity = jnp.array([[1.0, -1.0, 0.0], [2.0, 2.0, 0.0], [3.0, 0.0, 0.0]])  # (3, B)
+    state = initial_state(3)._replace(angular_velocity=angular_velocity)
+    physics = parameters()._replace(
+        inertia=jnp.array([[2.0, 1.0, 0.0], [1.0, 3.0, 0.0], [0.0, 0.0, 4.0]]),  # (3, 3)
+        inertia_inverse=jnp.array([[0.6, -0.2, 0.0], [-0.2, 0.4, 0.0], [0.0, 0.0, 0.25]]),  # (3, 3)
+    )
+    result = jax.device_get(
+        integrate_euler(state, physics, jnp.zeros((4, 3)), jnp.zeros((3, 1)), 0.01, steps=1, delay=False)
+    )
+    expected = np.array([[-1.8, 0.0, 0.0], [0.6, 0.0, 0.0], [0.25, 1.25, 0.0]])  # (3, B)
+    assert result.angular_acceleration.shape == result.state.angular_velocity.shape == (3, 3)
+    np.testing.assert_allclose(result.angular_acceleration, expected, atol=1e-7)
+    np.testing.assert_allclose(result.state.angular_velocity, jax.device_get(angular_velocity) + 0.01 * expected)
 
 
 def test_power_hover_zero_high_and_unequal_rotor_loading() -> None:

@@ -54,9 +54,16 @@ def quaternion_product(left: jax.Array, right: jax.Array) -> jax.Array:  # (4, B
 
 
 def rotate(orientation: jax.Array, vector: jax.Array) -> jax.Array:  # (4, B), (3, B) -> (3, B)
-    pure = jnp.concatenate((jnp.zeros_like(vector[:1]), vector))  # (4, B)
-    conjugate = orientation * jnp.array([1, -1, -1, -1], dtype=orientation.dtype)[:, None]  # (4, B)
-    return quaternion_product(quaternion_product(orientation, pure), conjugate)[1:]  # (3, B)
+    """Return (3, B) vectors transformed by q v q*, including nonunit input quaternions."""
+    w, x, y, z = orientation  # each (B,)
+    a, b, c = vector  # each (B,)
+    return jnp.stack(
+        (
+            (w * w + x * x - y * y - z * z) * a + 2 * (x * y - w * z) * b + 2 * (x * z + w * y) * c,
+            2 * (x * y + w * z) * a + (w * w - x * x + y * y - z * z) * b + 2 * (y * z - w * x) * c,
+            2 * (x * z - w * y) * a + 2 * (y * z + w * x) * b + (w * w - x * x - y * y + z * z) * c,
+        )
+    )  # (3, B)
 
 
 @partial(jax.jit, static_argnames=("steps", "delay"))
@@ -79,8 +86,9 @@ def integrate_euler(
     Returns: (3, B)/(4, B) state and final-substep thrust/accelerations, optional
         (B,) integrated energy/excess over the control interval.
     """
-    a, b, c = parameters.thrust_map  # each ()
-    desired_omega = (-b + jnp.sqrt(b * b - 4 * a * (c - desired_thrust))) / (2 * a)  # (4, B)
+    if delay:
+        a, b, c = parameters.thrust_map  # each ()
+        desired_omega = (-b + jnp.sqrt(b * b - 4 * a * (c - desired_thrust))) / (2 * a)  # (4, B)
 
     def substep(index: int, result: PhysicsResult[jax.Array]) -> PhysicsResult[jax.Array]:
         position, orientation, velocity, angular_velocity, omega = result.state  # (3/4, B)
@@ -107,9 +115,12 @@ def integrate_euler(
         acceleration = (
             rotate(orientation, force) / parameters.mass + jnp.array([0, 0, -9.81], dtype=velocity.dtype)[:, None]
         )  # (3, B)
-        angular_acceleration = parameters.inertia_inverse @ (
-            force_torque[1:] - jnp.cross(angular_velocity, parameters.inertia @ angular_velocity, axis=0)
-        )  # (3, B)
+        angular_momentum = parameters.inertia @ angular_velocity  # (3, B)
+        x, y, z = angular_velocity  # each (B,)
+        lx, ly, lz = angular_momentum  # each (B,)
+        # Keep the component-major layout; jnp.cross introduces a transposed copy on CPU.
+        gyroscopic_torque = jnp.stack((y * lz - z * ly, z * lx - x * lz, x * ly - y * lx))  # (3, B)
+        angular_acceleration = parameters.inertia_inverse @ (force_torque[1:] - gyroscopic_torque)  # (3, B)
         angular_quaternion = jnp.concatenate((jnp.zeros_like(angular_velocity[:1]), angular_velocity))  # (4, B)
         orientation = orientation + quaternion_product(orientation, angular_quaternion) * 0.5 * dt  # (4, B)
         orientation = orientation / jnp.sqrt(jnp.sum(orientation**2, axis=0))  # (4, B)

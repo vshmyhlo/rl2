@@ -213,6 +213,22 @@ def test_missing_difficulties_renormalize_without_fake_hard_cases() -> None:
         )
 
 
+@pytest.mark.parametrize("weight", [1e-100, 1e100], ids=["float32_underflow", "float32_overflow"])
+def test_route_sampling_preserves_extreme_positive_weights(weight: float) -> None:
+    route = Route(
+        points=((0.0, 0.0, 1.0), (3.0, 0.0, 1.0)),
+        direct_blocked=False,
+        constrained=False,
+        long=True,
+        detour_threshold=1.25,
+    )
+    # The unavailable hard category must not determine the scaling of available weights.
+    config = RouteConfig(weights=(0.0, weight, 1e300), jitter=0)
+    sampled = sample_route([route], empty_scene, 0.1, config, torch.zeros(3), torch.full((3,), 4.0), long_threshold=2.0)
+    assert sampled.difficulty == "medium"
+    assert set(sampled.points) == set(route.points)
+
+
 def test_evaluation_categories_horizons_and_serialization(door_routes: list[Route], tmp_path: Path) -> None:
     config = EvaluationConfig(manifest_path=str(tmp_path / "eval.json"), min_episode_steps=1)
     scenarios = select_scenarios("test/room.json", door_routes, config, seed=7, control_dt=0.02)
